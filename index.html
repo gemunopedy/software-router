@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>仮想ソフトウェアルータ（IOS-XE / IOS-XR / Junos）</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div id="toolbar">
+    <div class="hint">仮想ルータ (ローカル)</div>
+    <span id="current-router" class="badge">selected: -</span>
+    <div class="sep"></div>
+
+    <label class="switch">
+      <input type="checkbox" id="chk-edit" />
+      <span>Edit Mode</span>
+    </label>
+
+    <div class="edit-only">
+      <button id="btn-add-router">+ Router</button>
+      <button id="btn-add-link">+ Link</button>
+      <button id="btn-delete">Delete</button>
+      <button id="btn-save">Save Topology</button>
+    </div>
+
+    <div class="spacer"></div>
+    <span id="pcap-status" class="badge" title="保存されたパケット数">pcap: 0</span>
+    <button id="btn-save-pcap">Save pcap</button>
+    <button id="btn-clear-pcap">Clear pcap</button>
+    <button id="btn-clear">Clear Term</button>
+    <button id="btn-reset" class="danger">Reset All</button>
+    <span id="edit-hint" class="hint"></span>
+  </div>
+
+  <div id="topology">
+    <svg id="topo-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+    <div id="zoom-controls">
+      <button id="btn-zoom-in" title="ズームイン">＋</button>
+      <button id="btn-zoom-reset" title="ズームリセット">⤢</button>
+      <button id="btn-zoom-out" title="ズームアウト">－</button>
+    </div>
+  </div>
+
+  <div id="main-resize" title="ドラッグしてサイズ変更"></div>
+
+  <div id="terminal-area">
+    <div id="tabs" role="tablist"></div>
+    <div id="term-host"></div>
+  </div>
+
+  <div id="node-ctx-menu" class="ctx-menu" style="display:none">
+    <div class="menu-title">router</div>
+    <label class="menu-iface-row">
+      <span>Interface</span>
+      <select id="ctx-iface-select"><option value="">All</option></select>
+    </label>
+    <div class="menu-item" data-action="capture">▶ Capture (live)</div>
+    <div class="menu-item" data-action="open-term">Open terminal</div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+  <script src="data/topology.js"></script>
+  <script src="js/storage.js"></script>
+  <script src="js/packets.js"></script>
+  <script src="js/pcap-store.js"></script>
+  <script src="js/capture.js"></script>
+  <script src="js/resize.js"></script>
+  <script src="js/capture-view.js"></script>
+  <script src="js/sender.js"></script>
+  <script src="js/commands.js"></script>
+  <script src="js/ios-xe.js"></script>
+  <script src="js/topology.js"></script>
+  <script src="js/topology-editor.js"></script>
+  <script src="js/terminals.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
