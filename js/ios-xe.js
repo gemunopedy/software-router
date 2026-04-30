@@ -7,6 +7,8 @@
 //     戻り値: true=handled / false=unknown
 (function (global) {
   const Storage = global.RouterStorage;
+  const Packets = global.RouterPackets;
+  const Capture = global.RouterCapture;
 
   // --------- パーサユーティリティ ---------
 
@@ -86,6 +88,28 @@
     if (!topo || !topo.nodes) return 1;
     const i = topo.nodes.findIndex(n => n.id === routerId);
     return i >= 0 ? i + 1 : 1;
+  }
+
+  // GARP (Gratuitous ARP Request) を capture に emit する
+  // op=1 (request): sender IP = target IP = addr, target MAC = 00:00:00:00:00:00, dst eth = broadcast
+  function _sendGarp(router, ifaceName, addr) {
+    if (!Packets || !Capture) return;
+    const cfg = readCfg(router);
+    // interface の宣言順から 0-based ifaceIdx を求める
+    let ifaceIdx = 0, counter = 0;
+    for (const line of cfg.split('\n')) {
+      const m = line.match(/^interface\s+(\S+)/i);
+      if (!m) continue;
+      if (m[1].toLowerCase() === ifaceName.toLowerCase()) { ifaceIdx = counter; break; }
+      counter++;
+    }
+    const mac = Packets.buildIfaceMac(topoIdx(router.id), ifaceIdx);
+    const pkt = Packets.buildPacket({
+      proto: 'arp', op: 1,
+      src: addr, dst: addr,
+      srcMac: mac,
+    });
+    Capture.emit(router.id, pkt, { iface: ifaceName });
   }
 
   // IF 単位の MAC を Cisco ドット表記で返す (例: 5000.0001.0000)
@@ -264,6 +288,17 @@
         ifaceMacStr(rIdx, ifaceIdx).padEnd(16) + 'ARPA   ' + expandIfName(iface.name)
       );
     });
+
+    // ダイナミックエントリ（ARP 解決済みキャッシュ）
+    if (global.RouterSender && global.RouterSender.getArpEntries) {
+      global.RouterSender.getArpEntries(router.id).forEach(e => {
+        const macHex = Array.from(e.mac).map(b => b.toString(16).padStart(2,'0')).join('');
+        const macDot = macHex.slice(0,4) + '.' + macHex.slice(4,8) + '.' + macHex.slice(8,12);
+        const age = Math.floor((Date.now() - e.ts) / 60000);
+        const iface = e.iface ? expandIfName(e.iface) : '-';
+        io.println('Internet  ' + e.ip.padEnd(17) + String(age).padEnd(11) + macDot.padEnd(16) + 'ARPA   ' + iface);
+      });
+    }
   };
 
   // show interfaces [<name>] [counters]
@@ -427,6 +462,389 @@
     Storage.write(router.id, 'running', out.join('\n'));
   }
 
+  // ---- router プロセスブロック用 helpers ----
+
+  // BGP TCP リトライタイマー: 'routerId:neighborIp' -> timerId
+  const _bgpRetryTimers = new Map();
+  // BGP セッション確立済みフラグ: 'routerId:neighborIp' -> true
+  const _bgpEstablished = new Map();
+  // BGP セッション情報: 'routerId:neighborIp' -> { establishedAt: ms, keepaliveTimer: timerId }
+  const _bgpSessionInfo = new Map();
+
+  // リトライをスケジュール（共通ヘルパー）
+  function _scheduleRetry(timerKey, router, procKey, neighborIp, io) {
+    if (_bgpRetryTimers.has(timerKey)) clearTimeout(_bgpRetryTimers.get(timerKey));
+    const tid = setTimeout(() => {
+      _bgpRetryTimers.delete(timerKey);
+      try { _triggerBgpTcp(router, procKey, neighborIp, io); } catch (_) {}
+    }, 10000);
+    _bgpRetryTimers.set(timerKey, tid);
+  }
+
+  // config から BGP AS 番号を取得
+  function _getBgpAs(cfg) {
+    const m = cfg.match(/^router\s+bgp\s+(\d+)/im);
+    return m ? parseInt(m[1], 10) : 65000;
+  }
+
+  // config から BGP Router-ID を取得（bgp router-id > Loopback0 IP > 最初の IF IP）
+  function _getBgpRouterId(cfg) {
+    const ridM = cfg.match(/^\s*bgp\s+router-id\s+([\d.]+)/im);
+    if (ridM) return ridM[1];
+    const ifaces = parseInterfaces(cfg);
+    const lo = ifaces.find(b => /^loopback0$/i.test(b.name));
+    if (lo) { const ip = getIfaceIp(lo); if (ip) return ip; }
+    for (const b of ifaces) { const ip = getIfaceIp(b); if (ip) return ip; }
+    return '0.0.0.0';
+  }
+
+  // 受信側ルータが BGP SYN (port 179) を受け取った際の応答処理。
+  // 受信側は自分自身の running-config に neighbor 設定があれば SYN-ACK を送信、なければ RST,ACK。
+  function _onBgpSynReceived({
+    receiverRouterId, receiverIface, receiverMac, receiverIp,
+    senderRouterId, senderIface, senderMac, senderIp,
+    senderSport, senderIsn, timerKey, router, procKey, io,
+  }) {
+    const Packets = global.RouterPackets;
+    const Capture = global.RouterCapture;
+    const Pcap    = global.RouterPcap;
+    const BGP_PORT = 179;
+
+    function emit2(pkt, srcRid, srcIfc, dstRid, dstIfc) {
+      Pcap.append(srcRid, pkt);
+      if (Capture) Capture.emit(srcRid, pkt, { iface: srcIfc });
+      if (dstRid) {
+        Pcap.append(dstRid, pkt);
+        if (Capture) Capture.emit(dstRid, pkt, { iface: dstIfc });
+      }
+    }
+
+    // 受信側が自分の running-config を参照して判断する
+    const rcfg = Storage.read(receiverRouterId, 'running') ||
+                  Storage.read(receiverRouterId, 'startup') || '';
+    const hasNeighbor = /^router bgp\b/im.test(rcfg) &&
+      new RegExp(`^\\s*neighbor\\s+${senderIp.replace(/\./g, '\\.')}\\s+remote-as`, 'im').test(rcfg);
+
+    if (!hasNeighbor) {
+      // neighbor 未設定 → RST,ACK を送信し 10 秒後にリトライ
+      const rstPkt = Packets.buildPacket({
+        proto: 'tcp', src: receiverIp, dst: senderIp,
+        srcMac: receiverMac, dstMac: senderMac,
+        sport: BGP_PORT, dport: senderSport,
+        flags: ['rst', 'ack'], seq: 0, ack: senderIsn + 1,
+      });
+      emit2(rstPkt, senderRouterId, senderIface, receiverRouterId, receiverIface);
+      if (global.AppRefreshPcapStatus) global.AppRefreshPcapStatus();
+      _scheduleRetry(timerKey, router, procKey, receiverIp, io);
+      return;
+    }
+
+    // neighbor 設定あり → SYN-ACK を送信
+    const serverIsn = (Math.random() * 0xFFFFFF | 0) + 1;
+    const synAckPkt = Packets.buildPacket({
+      proto: 'tcp', src: receiverIp, dst: senderIp,
+      srcMac: receiverMac, dstMac: senderMac,
+      sport: BGP_PORT, dport: senderSport,
+      flags: ['syn', 'ack'], seq: serverIsn, ack: senderIsn + 1,
+    });
+    emit2(synAckPkt, senderRouterId, senderIface, receiverRouterId, receiverIface);
+
+    // 送信側が ACK を返して 3-way 完了
+    const ackPkt = Packets.buildPacket({
+      proto: 'tcp', src: senderIp, dst: receiverIp,
+      srcMac: senderMac, dstMac: receiverMac,
+      sport: senderSport, dport: BGP_PORT,
+      flags: ['ack'], seq: senderIsn + 1, ack: serverIsn + 1,
+    });
+    emit2(ackPkt, senderRouterId, senderIface, receiverRouterId, receiverIface);
+
+    // --- BGP OPEN 交換 ---
+    const scfg = Storage.read(senderRouterId,   'running') || Storage.read(senderRouterId,   'startup') || '';
+
+    const sAs   = _getBgpAs(scfg);
+    const sRid  = _getBgpRouterId(scfg);
+    const rAs   = _getBgpAs(rcfg);
+    const rRid  = _getBgpRouterId(rcfg);
+
+    // OPEN: 送信側 → 受信側
+    const openS = Packets.buildPacket({
+      proto: 'bgp', bgpType: 'open',
+      src: senderIp, dst: receiverIp, srcMac: senderMac, dstMac: receiverMac,
+      sport: senderSport, dport: BGP_PORT,
+      as: sAs, hold: 180, bgpId: sRid,
+      seq: senderIsn + 1, ack: serverIsn + 1,
+    });
+    emit2(openS, senderRouterId, senderIface, receiverRouterId, receiverIface);
+
+    // OPEN: 受信側 → 送信側
+    const openR = Packets.buildPacket({
+      proto: 'bgp', bgpType: 'open',
+      src: receiverIp, dst: senderIp, srcMac: receiverMac, dstMac: senderMac,
+      sport: BGP_PORT, dport: senderSport,
+      as: rAs, hold: 180, bgpId: rRid,
+      seq: serverIsn + 1, ack: senderIsn + 1,
+    });
+    emit2(openR, senderRouterId, senderIface, receiverRouterId, receiverIface);
+
+    // KEEPALIVE: 送信側 → 受信側
+    const kaS = Packets.buildPacket({
+      proto: 'bgp', bgpType: 'keepalive',
+      src: senderIp, dst: receiverIp, srcMac: senderMac, dstMac: receiverMac,
+      sport: senderSport, dport: BGP_PORT,
+      seq: senderIsn + 1, ack: serverIsn + 1,
+    });
+    emit2(kaS, senderRouterId, senderIface, receiverRouterId, receiverIface);
+
+    // KEEPALIVE: 受信側 → 送信側
+    const kaR = Packets.buildPacket({
+      proto: 'bgp', bgpType: 'keepalive',
+      src: receiverIp, dst: senderIp, srcMac: receiverMac, dstMac: senderMac,
+      sport: BGP_PORT, dport: senderSport,
+      seq: serverIsn + 1, ack: senderIsn + 1,
+    });
+    emit2(kaR, senderRouterId, senderIface, receiverRouterId, receiverIface);
+
+    // OPEN Message 受信ログ（送信側ターミナル）
+    io.println(`%BGP-5-OPEN: OPEN Message received from ${receiverIp}: AS ${rAs}, Hold Time ${180}, BGP Router-ID ${rRid}`);
+    io.println(`%BGP-5-OPEN: OPEN Message sent to ${receiverIp}: AS ${sAs}, Hold Time ${180}, BGP Router-ID ${sRid}`);
+    io.println(`%BGP-5-ADJCHANGE: neighbor ${receiverIp} Up`);
+
+    // 確立済みに登録しリトライタイマーをキャンセル
+    _bgpEstablished.set(timerKey, true);
+    // ルータ種別ごとにKEEPALIVE間隔を決定
+    const senderOs = (router && router.os) || 'ios-xe';
+    const interval = senderOs === 'junos' ? 30000 : 60000;
+    // 既存タイマーがあればクリア
+    if (_bgpSessionInfo.has(timerKey) && _bgpSessionInfo.get(timerKey).keepaliveTimer) {
+      clearInterval(_bgpSessionInfo.get(timerKey).keepaliveTimer);
+    }
+    // KEEPALIVE送信タイマー
+    const keepaliveTimer = setInterval(() => {
+      const ka = Packets.buildPacket({
+        proto: 'bgp', bgpType: 'keepalive',
+        src: senderIp, dst: receiverIp, srcMac: senderMac, dstMac: receiverMac,
+        sport: senderSport, dport: BGP_PORT,
+        seq: senderIsn + 1, ack: serverIsn + 1,
+      });
+      emit2(ka, senderRouterId, senderIface, receiverRouterId, receiverIface);
+    }, interval);
+    _bgpSessionInfo.set(timerKey, { establishedAt: Date.now(), keepaliveTimer });
+    if (_bgpRetryTimers.has(timerKey)) {
+      clearTimeout(_bgpRetryTimers.get(timerKey));
+      _bgpRetryTimers.delete(timerKey);
+    }
+    if (global.AppRefreshPcapStatus) global.AppRefreshPcapStatus();
+  }
+
+  // BGP neighbor 設定時に TCP 3-way handshake (port 179) を自動実行
+  function _triggerBgpTcp(router, procKey, neighborIp, io) {
+    const Sender = global.RouterSender;
+    const Packets = global.RouterPackets;
+    const Capture = global.RouterCapture;
+    const Pcap    = global.RouterPcap;
+    if (!Sender || !Packets || !Pcap) return;
+
+    const timerKey = router.id + ':' + neighborIp;
+
+    // 既に確立済みならスキップ
+    if (_bgpEstablished.get(timerKey)) return;
+
+    const cfg = Storage.read(router.id, 'running') || '';
+
+    // update-source IF がある場合はそのIPを使う
+    const usSrc = (() => {
+      const usM = cfg.match(new RegExp(`neighbor\\s+${neighborIp}\\s+update-source\\s+(\\S+)`, 'i'));
+      if (!usM) return null;
+      const usIface = usM[1];
+      const ifaces = parseInterfaces(cfg);
+      const blk = ifaces.find(f => f.name.toLowerCase().startsWith(usIface.toLowerCase()));
+      return blk ? getIfaceIp(blk) : null;
+    })();
+
+    // 同一サブネット IF か最初の物理 IF から送信元を選ぶ
+    const srcIp = usSrc || (() => {
+      const nOcts = neighborIp.split('.').map(Number);
+      const ifaces = parseInterfaces(cfg);
+      for (const blk of ifaces) {
+        if (/^loopback/i.test(blk.name)) continue;
+        const ip = getIfaceIp(blk);
+        if (!ip) continue;
+        const mask = getIfaceMask(blk);
+        if (mask) {
+          const mOcts = mask.split('.').map(Number);
+          const iOcts = ip.split('.').map(Number);
+          if (iOcts.every((b, i) => (b & mOcts[i]) === (nOcts[i] & mOcts[i]))) return ip;
+        }
+      }
+      for (const blk of ifaces) {
+        if (/^loopback/i.test(blk.name)) continue;
+        const ip = getIfaceIp(blk);
+        if (ip) return ip;
+      }
+      return null;
+    })();
+
+    if (!srcIp) { _scheduleRetry(timerKey, router, procKey, neighborIp, io); return; }
+
+    const ifaceMap = global.RouterSender ? (() => {
+      // getIfaceMap は sender の内部関数なので自前でパース
+      const map = {};
+      parseInterfaces(cfg).forEach(blk => {
+        const ip = getIfaceIp(blk);
+        if (ip) map[ip] = blk.name;
+      });
+      return map;
+    })() : {};
+    const iface = ifaceMap[srcIp] || null;
+
+    // ARP 解決
+    const dstMac = Sender.resolveArp(router, srcIp, neighborIp, null);
+    if (!dstMac) { _scheduleRetry(timerKey, router, procKey, neighborIp, io); return; }
+
+    const rIdx = topoIdx(router.id);
+    const names = (cfg.match(/^interface\s+(\S+)/gim) || []).map(l => l.replace(/^interface\s+/i,'').trim());
+    const ifaceIdx = iface ? Math.max(0, names.findIndex(n => n.toLowerCase() === iface.toLowerCase())) : 0;
+    const srcMac = Packets.buildIfaceMac(rIdx, ifaceIdx);
+
+    const sport = 1024 + Math.floor(Math.random() * 60000);
+    const isn = (Math.random() * 0xFFFFFF | 0) + 1;
+    const BGP_PORT = 179;
+
+    const ownerCfg = (() => {
+      const topo = global.TOPOLOGY;
+      if (!topo) return null;
+      for (const node of topo.nodes) {
+        const c = Storage.read(node.id, 'running') || Storage.read(node.id, 'startup') || '';
+        const ifaces2 = parseInterfaces(c);
+        for (const blk of ifaces2) {
+          if (getIfaceIp(blk) === neighborIp) return { routerId: node.id, iface: blk.name, cfg: c };
+        }
+      }
+      return null;
+    })();
+
+    const ownerMac = dstMac;
+    const ownerIface = ownerCfg ? ownerCfg.iface : null;
+    const ownerRouterId = ownerCfg ? ownerCfg.routerId : null;
+
+    function emit2(pkt, srcRid, srcIfc, dstRid, dstIfc) {
+      Pcap.append(srcRid, pkt);
+      if (Capture) Capture.emit(srcRid, pkt, { iface: srcIfc });
+      if (dstRid) {
+        Pcap.append(dstRid, pkt);
+        if (Capture) Capture.emit(dstRid, pkt, { iface: dstIfc });
+      }
+    }
+
+    // 1. SYN
+    const synPkt = Packets.buildPacket({
+      proto: 'tcp', src: srcIp, dst: neighborIp, srcMac, dstMac: ownerMac,
+      sport, dport: BGP_PORT, flags: ['syn'], seq: isn, ack: 0,
+    });
+    emit2(synPkt, router.id, iface, ownerRouterId, ownerIface);
+
+    // 受信側ルータが存在しない場合はリトライ
+    if (!ownerRouterId) { _scheduleRetry(timerKey, router, procKey, neighborIp, io); return; }
+
+    // 受信側ルータが SYN を受け取り、自分自身の config を確認して応答する
+    _onBgpSynReceived({
+      receiverRouterId: ownerRouterId,
+      receiverIface:    ownerIface,
+      receiverMac:      ownerMac,
+      receiverIp:       neighborIp,
+      senderRouterId:   router.id,
+      senderIface:      iface,
+      senderMac:        srcMac,
+      senderIp:         srcIp,
+      senderSport:      sport,
+      senderIsn:        isn,
+      timerKey, router, procKey, io,
+    });
+  }
+
+  // interface ブロックから IP を取得
+  function getIfaceIp(blk) {
+    for (const l of blk.lines) {
+      const m = l.trim().match(/^ip\s+address\s+([\d.]+)/i);
+      if (m) return m[1];
+    }
+    return null;
+  }
+  function getIfaceMask(blk) {
+    for (const l of blk.lines) {
+      const m = l.trim().match(/^ip\s+address\s+[\d.]+\s+([\d.]+)/i);
+      if (m) return m[1];
+    }
+    return null;
+  }
+  // 'router bgp 65001' ブロック内の行を更新/追加する
+  function _updateRouterLine(router, procKey, matchRe, newLine) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const lines = cfg.split('\n');
+    const headerRe = new RegExp(`^router\\s+${procKey.replace(/\s+/g, '\\s+')}\\s*$`, 'i');
+    let inBlock = false, replaced = false;
+    const out = [];
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { inBlock = true; out.push(t); continue; }
+      if (inBlock) {
+        if (/^[^ \t!]/.test(t) && t !== '') { inBlock = false; }
+        else if (t.startsWith(' ') || t.startsWith('\t')) {
+          if (matchRe.test(t.trim())) { out.push(' ' + newLine); replaced = true; continue; }
+        }
+      }
+      out.push(t);
+    }
+    if (!replaced) {
+      const insertIdx = out.findIndex(l => headerRe.test(l.trimEnd()));
+      if (insertIdx >= 0) {
+        let end = insertIdx + 1;
+        while (end < out.length && (out[end].startsWith(' ') || out[end].startsWith('\t') || out[end] === '')) end++;
+        out.splice(end, 0, ' ' + newLine);
+      }
+    }
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  // router プロセスブロック内のマッチ行を1行削除する
+  function _removeRouterLine(router, procKey, matchRe) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^router\\s+${procKey.replace(/\s+/g, '\\s+')}\\s*$`, 'i');
+    let inBlock = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { inBlock = true; return true; }
+      if (inBlock && (t.startsWith(' ') || t.startsWith('\t'))) {
+        return !matchRe.test(t.trim());
+      }
+      if (inBlock && /^[^ \t!]/.test(t) && t !== '') inBlock = false;
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  // router プロセスブロック内のマッチ行を複数削除する（正規表現が部分一致する全行）
+  function _removeRouterLines(router, procKey, matchRe) {
+    _removeRouterLine(router, procKey, matchRe);
+  }
+
+  // router プロセスブロックを丸ごと削除する
+  function _removeRouterBlock(router, procKey) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^router\\s+${procKey.replace(/\s+/g, '\\s+')}\\s*$`, 'i');
+    let skip = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { skip = true; return false; }
+      if (skip) {
+        if (t.startsWith(' ') || t.startsWith('\t') || t === '') return false;
+        skip = false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
   // ------- show running-config 整形出力 -------
   // interface ブロックを Loopback → それ以外 (GigabitEthernet 等) の順に並び替えて出力
   function printRunningConfig(cfg, router, io) {
@@ -439,27 +857,37 @@
     io.println('!');
     io.println('version 17.15');
     io.println('!');
+    io.println('hostname ' + host);
+    io.println('!');
 
-    // interface ブロック以外の行と interface ブロックを分離して再構築
+    // interface / router ブロック以外の行と各ブロックを分離して再構築
     const lines = (cfg || '').split('\n');
-    const nonIfLines = [];   // interface ブロック以外
+    const nonIfLines = [];   // interface / router ブロック以外
     const ifBlocks = [];     // [{header, lines[]}]
+    const routerBlocks = []; // [{header, lines[]}]  router bgp 等
     let curBlock = null;
+    let curType = null; // 'if' | 'router'
     for (const raw of lines) {
       const im = raw.match(/^interface\s+(\S+)/i);
+      const rm = raw.match(/^router\s+\S+/i);
       if (im) {
         curBlock = { header: raw, lines: [] };
-        ifBlocks.push(curBlock);
-      } else if (curBlock) {
-        // 非インデント行 (! 以外) で次セクション開始 → ブロック終了
+        ifBlocks.push(curBlock); curType = 'if'; continue;
+      }
+      if (rm) {
+        curBlock = { header: raw, lines: [] };
+        routerBlocks.push(curBlock); curType = 'router'; continue;
+      }
+      if (curBlock) {
         if (raw !== '' && !/^[ \t!]/.test(raw)) {
-          curBlock = null;
-          nonIfLines.push(raw);
+          curBlock = null; curType = null;
+          // hostname は固定出力済みなのでスキップ
+          if (!/^hostname\s+/i.test(raw)) nonIfLines.push(raw);
         } else {
           curBlock.lines.push(raw);
         }
       } else {
-        nonIfLines.push(raw);
+        if (!/^hostname\s+/i.test(raw)) nonIfLines.push(raw);
       }
     }
 
@@ -470,10 +898,18 @@
       return aLo - bLo;
     });
 
-    nonIfLines.forEach(l => io.println(l));
+    nonIfLines.forEach(l => { if (l.trim() !== '') io.println(l); });
+    io.println('!');
     ifBlocks.forEach(blk => {
-      io.println(blk.header);
-      blk.lines.forEach(l => io.println(l));
+      const expandedName = expandIfName(blk.header.replace(/^interface\s+/i, '').trim());
+      io.println('interface ' + expandedName);
+      blk.lines.forEach(l => { if (l.trim() !== '') io.println(l); });
+      io.println('!');
+    });
+    routerBlocks.forEach(blk => {
+      io.println(blk.header.trimEnd());
+      blk.lines.forEach(l => { if (l.trim() !== '') io.println(l); });
+      io.println('!');
     });
 
     if (cfg && !/^end\s*$/im.test(cfg)) io.println('end');
@@ -483,15 +919,58 @@
   // ------- show ip bgp (簡易) -------
   function showIpBgp(args, router, cfg, io) {
     const sub = args[0] ? args[0].toLowerCase() : '';
+
+    // running-config から router bgp ブロックを解析
+    const bgpM = cfg.match(/^router\s+bgp\s+(\d+)\s*$/im);
+    if (!bgpM) {
+      io.println('% BGP not active');
+      return;
+    }
+    const asn = bgpM[1];
+
+    // bgp router-id を取得
+    const ridM = cfg.match(/^\s+bgp\s+router-id\s+([\d.]+)/im);
+    const routerId = ridM ? ridM[1] : '0.0.0.0';
+
+    // neighbor remote-as 行を収集
+    const neighbors = [];
+    const nRe = /^\s+neighbor\s+([\d.]+)\s+remote-as\s+(\d+)/gim;
+    let nm;
+    while ((nm = nRe.exec(cfg)) !== null) {
+      neighbors.push({ ip: nm[1], as: nm[2] });
+    }
+
     if (sub === 'summary') {
-      io.println('BGP router identifier 0.0.0.0, local AS number 0');
+      io.println(`BGP router identifier ${routerId}, local AS number ${asn}`);
       io.println('BGP table version is 1, main routing table version 1');
       io.println('');
       io.println('Neighbor        V    AS MsgRcvd MsgSent TblVer InQ OutQ  Up/Down  State/PfxRcd');
-      io.println('(no BGP neighbors configured - emulated)');
+      neighbors.forEach(n => {
+        const ip   = n.ip.padEnd(15);
+        const as   = n.as.padStart(6);
+        const tk   = router.id + ':' + n.ip;
+        const est  = _bgpEstablished.get(tk);
+        const info = _bgpSessionInfo.get(tk);
+        let updown = 'never   ';
+        let statePfx = 'Idle';
+        if (est && info) {
+          const sec = Math.floor((Date.now() - info.establishedAt) / 1000);
+          const d = Math.floor(sec / 86400);
+          const h = Math.floor((sec % 86400) / 3600);
+          const m = Math.floor((sec % 3600) / 60);
+          const s = sec % 60;
+          updown = d > 0
+            ? `${d}d${String(h).padStart(2,'0')}h    `
+            : `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+          statePfx = '0';
+        }
+        io.println(`${ip} 4 ${as}       0       0      0    0    0 ${updown}  ${statePfx}`);
+      });
+      io.println('');
       return;
     }
-    io.println('BGP table version is 1, local router ID 0.0.0.0');
+
+    io.println(`BGP table version is 1, local router ID ${routerId}`);
     io.println('Status codes: s suppressed, d damped, h history, * valid, > best, i - internal');
     io.println('');
     io.println('(no BGP entries - emulated)');
@@ -505,8 +984,9 @@
 
     // ============================================================
     // configure モード内ハンドラ
-    // state.configMode: null | 'global' | 'if'
+    // state.configMode: null | 'global' | 'if' | 'router'
     // state.configIface: 編集中のインタフェース名 (config-if 時のみ)
+    // state.configRouter: 編集中のルータプロセス名 e.g. 'bgp 65001' (config-router 時のみ)
     // ============================================================
     if (state.configMode) {
       // exit / end は両モードで共通
@@ -516,9 +996,10 @@
         return true;
       }
       if (verb === 'exit') {
-        if (state.configMode === 'if') {
+        if (state.configMode === 'if' || state.configMode === 'router') {
           state.configMode = 'global';
           state.configIface = null;
+          state.configRouter = null;
         } else {
           state.configMode = null;
         }
@@ -537,6 +1018,8 @@
             io.println('% Invalid address format'); return true;
           }
           _updateIfaceLine(router, ifaceName, /^ip address\s+/i, `ip address ${addr} ${mask}`);
+          // GARP 送信: アドレス設定直後に Gratuitous ARP を emit
+          _sendGarp(router, ifaceName, addr);
           return true;
         }
 
@@ -573,6 +1056,86 @@
         return true;
       }
 
+      // ---------- config-router モード ----------
+      if (state.configMode === 'router') {
+        const procKey = state.configRouter; // e.g. 'bgp 65001'
+
+        // neighbor <ip> remote-as <as>
+        if (verb === 'neighbor') {
+          const nIp = parts[1], key2 = (parts[2] || '').toLowerCase(), val = parts[3];
+          if (!nIp) { io.println('% Incomplete command.'); return true; }
+          if (key2 === 'remote-as') {
+            if (!val) { io.println('% Incomplete command.'); return true; }
+            _updateRouterLine(router, procKey, new RegExp(`^neighbor\\s+${nIp}\\s+remote-as\\s+`,'i'), `neighbor ${nIp} remote-as ${val}`);
+            // TCP 3-way handshake (BGP port 179) を自動実行
+            // 以前の確立済みフラグ・リトライタイマーをリセットして再試行
+            const tk = router.id + ':' + nIp;
+            _bgpEstablished.delete(tk);
+            // セッション切断時はKEEPALIVEタイマーも解除
+            if (_bgpSessionInfo.has(tk) && _bgpSessionInfo.get(tk).keepaliveTimer) {
+              clearInterval(_bgpSessionInfo.get(tk).keepaliveTimer);
+            }
+            _bgpSessionInfo.delete(tk);
+            if (_bgpRetryTimers.has(tk)) { clearTimeout(_bgpRetryTimers.get(tk)); _bgpRetryTimers.delete(tk); }
+            _triggerBgpTcp(router, procKey, nIp, io);
+          } else if (key2 === 'description') {
+            const desc = parts.slice(3).join(' ');
+            _updateRouterLine(router, procKey, new RegExp(`^neighbor\\s+${nIp}\\s+description\\s+`,'i'), `neighbor ${nIp} description ${desc}`);
+          } else if (key2 === 'update-source') {
+            if (!val) { io.println('% Incomplete command.'); return true; }
+            _updateRouterLine(router, procKey, new RegExp(`^neighbor\\s+${nIp}\\s+update-source\\s+`,'i'), `neighbor ${nIp} update-source ${val}`);
+          } else if (key2 === 'shutdown') {
+            _updateRouterLine(router, procKey, new RegExp(`^neighbor\\s+${nIp}\\s+shutdown$`,'i'), `neighbor ${nIp} shutdown`);
+          } else {
+            io.println(`% Unrecognized neighbor sub-command: ${key2}`);
+          }
+          return true;
+        }
+
+        // no neighbor <ip> ...
+        if (verb === 'no' && (parts[1] || '').toLowerCase() === 'neighbor') {
+          const nIp = parts[2], key2 = (parts[3] || '').toLowerCase();
+          if (!nIp) { io.println('% Incomplete command.'); return true; }
+          if (!key2 || key2 === 'remote-as') {
+            // remote-as なしで no neighbor → ネイバー全行削除
+            _removeRouterLines(router, procKey, new RegExp(`^neighbor\\s+${nIp}\\s+`,'i'));
+          } else {
+            _removeRouterLine(router, procKey, new RegExp(`^neighbor\\s+${nIp}\\s+${key2}\\s*`,'i'));
+          }
+          return true;
+        }
+
+        // router-id <id>
+        if (verb === 'router-id' || (verb === 'bgp' && (parts[1] || '').toLowerCase() === 'router-id')) {
+          const rid = verb === 'bgp' ? parts[2] : parts[1];
+          if (!rid) { io.println('% Incomplete command.'); return true; }
+          _updateRouterLine(router, procKey, /^bgp router-id\s+/i, `bgp router-id ${rid}`);
+          return true;
+        }
+
+        // network <prefix> mask <mask>
+        if (verb === 'network') {
+          const prefix = parts[1];
+          if (!prefix) { io.println('% Incomplete command.'); return true; }
+          const maskIdx = parts.findIndex(p => p.toLowerCase() === 'mask');
+          const mask = maskIdx >= 0 ? parts[maskIdx + 1] : null;
+          const line = mask ? `network ${prefix} mask ${mask}` : `network ${prefix}`;
+          _updateRouterLine(router, procKey, new RegExp(`^network\\s+${prefix}\\s*`,'i'), line);
+          return true;
+        }
+
+        // no network <prefix>
+        if (verb === 'no' && (parts[1] || '').toLowerCase() === 'network') {
+          const prefix = parts[2];
+          if (!prefix) { io.println('% Incomplete command.'); return true; }
+          _removeRouterLine(router, procKey, new RegExp(`^network\\s+${prefix}\\s*`,'i'));
+          return true;
+        }
+
+        io.println(`% Invalid input in config-router mode: ${parts.join(' ')}`);
+        return true;
+      }
+
       // ---------- global config モード ----------
 
       // interface <name>
@@ -594,6 +1157,30 @@
         }
         state.configMode = 'if';
         state.configIface = resolvedName;
+        return true;
+      }
+
+      // router bgp <as-number>
+      if (verb === 'router' && (parts[1] || '').toLowerCase() === 'bgp') {
+        const asn = parts[2];
+        if (!asn || isNaN(+asn)) { io.println('% Incomplete command: specify AS number.'); return true; }
+        const procKey = `bgp ${asn}`;
+        // running-config に router bgp ブロックがなければ追加
+        const cfg = Storage.read(router.id, 'running') || '';
+        const re = new RegExp(`^router\\s+bgp\\s+${asn}\\s*$`, 'im');
+        if (!re.test(cfg)) {
+          Storage.write(router.id, 'running', cfg.trimEnd() + `\nrouter bgp ${asn}\n`);
+        }
+        state.configMode = 'router';
+        state.configRouter = procKey;
+        return true;
+      }
+
+      // no router bgp <as-number>
+      if (verb === 'no' && (parts[1] || '').toLowerCase() === 'router' && (parts[2] || '').toLowerCase() === 'bgp') {
+        const asn = parts[3];
+        if (!asn) { io.println('% Incomplete command.'); return true; }
+        _removeRouterBlock(router, `bgp ${asn}`);
         return true;
       }
 
@@ -740,16 +1327,37 @@
     if (mode === 'global') {
       // global config モード
       if (before.length === 0) {
-        return ['interface', 'hostname', 'no', 'exit', 'end']
+        return ['interface', 'hostname', 'router', 'no', 'exit', 'end']
           .filter(c => c.startsWith(last.toLowerCase()));
       }
       const v = before[0];
       if ((v === 'interface' || v === 'int') && before.length === 1)
         return ifaceNames().filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
+      if (v === 'router' && before.length === 1)
+        return ['bgp'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'no' && before.length === 1)
-        return ['interface'].filter(s => s.startsWith(last.toLowerCase()));
+        return ['interface', 'router'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'no' && (before[1] === 'interface' || before[1] === 'int') && before.length === 2)
         return ifaceNames().filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
+      if (v === 'no' && before[1] === 'router' && before.length === 2)
+        return ['bgp'].filter(s => s.startsWith(last.toLowerCase()));
+      return [];
+    }
+
+    if (mode === 'router') {
+      // config-router モード
+      if (before.length === 0) {
+        return ['neighbor', 'network', 'bgp', 'no', 'exit', 'end']
+          .filter(c => c.startsWith(last.toLowerCase()));
+      }
+      const v = before[0];
+      if (v === 'bgp' && before.length === 1)
+        return ['router-id'].filter(s => s.startsWith(last.toLowerCase()));
+      if (v === 'neighbor' && before.length === 2)
+        return ['remote-as', 'description', 'update-source', 'shutdown']
+          .filter(s => s.startsWith(last.toLowerCase()));
+      if (v === 'no' && before.length === 1)
+        return ['neighbor', 'network'].filter(s => s.startsWith(last.toLowerCase()));
       return [];
     }
 
@@ -830,5 +1438,38 @@
     return [];
   }
 
-  global.RouterIosXe = { handleCommand, complete };
+  // ページロード後に running-config の BGP neighbor を自動再起動する
+  // （_bgpRetryTimers / _bgpEstablished はリロードで消えるため再トリガーが必要）
+  function restoreBgpSessions(router) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const dummyIo = { println: () => {} };
+    const lines = cfg.split('\n');
+    let inBgp = false, procKey = null;
+    for (const raw of lines) {
+      const t = raw.trim();
+      const bgpM = t.match(/^router\s+bgp\s+(\S+)/i);
+      if (bgpM) { inBgp = true; procKey = `bgp ${bgpM[1]}`; continue; }
+      if (inBgp) {
+        // ブロック終端の判定は raw（インデント前の元行）で行う
+        // t（trim済み）で判定すると全行が非空白始まりになるため誤判定する
+        if (/^[^\s!]/.test(raw) && t !== '') { inBgp = false; procKey = null; continue; }
+        const nM = t.match(/^neighbor\s+([\d.]+)\s+remote-as\s+\d+/i);
+        if (nM && procKey) {
+          const neighborIp = nM[1];
+          const tk = router.id + ':' + neighborIp;
+          // ページリロード後は確立済み状態をリセット
+          _bgpEstablished.delete(tk);
+          if (_bgpSessionInfo.has(tk) && _bgpSessionInfo.get(tk).keepaliveTimer) {
+            clearInterval(_bgpSessionInfo.get(tk).keepaliveTimer);
+          }
+          _bgpSessionInfo.delete(tk);
+          if (_bgpRetryTimers.has(tk)) { clearTimeout(_bgpRetryTimers.get(tk)); _bgpRetryTimers.delete(tk); }
+          // 少し遅延させてページ表示が完了してから開始
+          setTimeout(() => _triggerBgpTcp(router, procKey, neighborIp, dummyIo), 500);
+        }
+      }
+    }
+  }
+
+  global.RouterIosXe = { handleCommand, complete, restoreBgpSessions };
 })(window);

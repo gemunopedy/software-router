@@ -27,27 +27,30 @@
     let activeId = null;
 
     function makeIO(term) {
+      // 画面表示のみクリア。既存の表示内容は改行でスクロールバックへ退避する。
+      // xterm.js の term.clear() や \x1b[2J\x1b[3J はスクロールバックも消去するため使わない。
+      function clearViewport() {
+        term.scrollToBottom();
+        const rows = term.rows || 24;
+        // rows 行ぶん改行を送ると現在表示されている内容は上にスクロールしてスクロールバックに残る
+        term.write('\r\n'.repeat(rows));
+        // カーソルを左上へ
+        term.write('\x1b[H');
+      }
       return {
         println(s = '') { term.writeln(s); },
-        clear() { term.clear(); },
+        print(s = '')   { term.write(s); },
+        clear() { clearViewport(); },
       };
     }
 
-    // Shift+Right/Left でタブ切り替え（xterm 内でも捕捉できるよう各インスタンスに付与）
+    // Shift+Right/Left でタブ切り替え: xterm がキーを内部処理しないよう抑制のみ行う
+    // ナビゲーション自体は document keydown に一本化
     function attachTabSwitch(term) {
       term.attachCustomKeyEventHandler(e => {
         if (e.type === 'keydown' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey
             && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {
-          e.preventDefault();
-          const ids = [...sessions.keys()];
-          if (ids.length > 1) {
-            const cur = ids.indexOf(activeId);
-            const next = e.key === 'ArrowRight'
-              ? ids[(cur + 1) % ids.length]
-              : ids[(cur - 1 + ids.length) % ids.length];
-            activate(next);
-          }
-          return false;
+          return false; // xterm の内部処理を抑制（イベントは document へ伝播する）
         }
         return true;
       });
@@ -66,6 +69,7 @@
         cursorBlink: true,
         fontFamily: 'Menlo, Consolas, "DejaVu Sans Mono", monospace',
         fontSize: 14,
+        scrollback: 5000,
         theme: { background: '#000000', foreground: '#e6e6e6' },
       });
       const fit = FitAddonCtor ? new FitAddonCtor() : null;
@@ -89,6 +93,26 @@
       function saveHistory(hist) {
         try { localStorage.setItem(HIST_KEY, JSON.stringify(hist.slice(-HIST_MAX))); } catch (_) {}
       }
+
+      // configMode/configIface/configRouter の永続化
+      const STATE_KEY = 'router:state:' + router.id;
+      function loadState() {
+        try { return JSON.parse(localStorage.getItem(STATE_KEY) || 'null') || {}; } catch (_) { return {}; }
+      }
+      function saveState() {
+        try {
+          localStorage.setItem(STATE_KEY, JSON.stringify({
+            configMode:   state.configMode   || null,
+            configIface:  state.configIface  || null,
+            configRouter: state.configRouter || null,
+          }));
+        } catch (_) {}
+      }
+      const savedState = loadState();
+      state.configMode   = savedState.configMode   || null;
+      state.configIface  = savedState.configIface  || null;
+      state.configRouter = savedState.configRouter || null;
+
       const session = {
         router, term, fit, pane, tab: null, state, io,
         currentLine: '',
@@ -97,11 +121,14 @@
         historyIdx: -1,       // -1 = 編集中の未確定行を表示中
         savedLine: '',        // 履歴閲覧開始時の編集中行を退避
         killBuffer: '',       // Ctrl+U / Ctrl+K / Ctrl+W のヤンクバッファ
+        saveState,
       };
 
       // 初期メッセージ
       const banner = opts.buildBanner ? opts.buildBanner(router) : null;
       if (banner) banner.split('\n').forEach(l => term.writeln(l));
+      // configMode が復元されている場合はプロンプトを再計算
+      state.prompt = opts.buildPrompt(state.router, state);
       term.write(state.prompt);
 
       // -------------------- ライン編集ヘルパ --------------------
@@ -239,6 +266,7 @@
         (async () => {
           await opts.handleLine(state.router, line, state, io);
           state.prompt = opts.buildPrompt(state.router, state);
+          session.saveState();
           if (!state.inPasteMode) term.write(state.prompt);
         })();
       }
@@ -295,8 +323,11 @@
           }
           if (ch === '\x10') { showHistory(-1); i++; continue; }                        // Ctrl+P
           if (ch === '\x0e') { showHistory(+1); i++; continue; }                        // Ctrl+N
-          if (ch === '\x0c') {                                                          // Ctrl+L: clear
-            term.write('\x1b[2J\x1b[H');
+          if (ch === '\x0c') {                                                          // Ctrl+L: 画面をクリアしてプロンプト再表示（scrollback は保持）
+            term.scrollToBottom();
+            const rows = term.rows || 24;
+            term.write('\r\n'.repeat(rows));
+            term.write('\x1b[H');
             term.write(state.prompt + session.currentLine);
             moveLeft(session.currentLine.length - session.cursor);
             i++; continue;
@@ -390,6 +421,7 @@
       tab.appendChild(os);
       tab.appendChild(close);
       tab.addEventListener('click', () => activate(router.id));
+      _makeDraggable(tab);
       tabsEl.appendChild(tab);
       return tab;
     }
@@ -413,8 +445,16 @@
       });
       // レイアウト確定後に fit & focus
       requestAnimationFrame(() => {
-        try { if (s.fit) s.fit.fit(); } catch (_) {}
-        s.term.focus();
+        if (s.term) {
+          try { if (s.fit) s.fit.fit(); } catch (_) {}
+          s.term.focus();
+        } else {
+          // HTML ペイン（キャプチャ等）: xterm のフォーカスを外してドキュメントに戻す
+          sessions.forEach(sess => {
+            if (sess.term) try { sess.term.textarea && sess.term.textarea.blur(); } catch (_) {}
+          });
+          s.pane.focus();
+        }
       });
       if (opts.onActivate) opts.onActivate(id);
     }
@@ -472,6 +512,7 @@
         cursorBlink: !!p.onLine,
         fontFamily: 'Menlo, Consolas, "DejaVu Sans Mono", monospace',
         fontSize: 13,
+        scrollback: 5000,
         theme: { background: '#000000', foreground: '#e6e6e6' },
       });
       const fit = FitAddonCtor ? new FitAddonCtor() : null;
@@ -559,6 +600,7 @@
       const pane = document.createElement('div');
       pane.className = 'term-pane html-pane';
       pane.dataset.id = p.id;
+      pane.setAttribute('tabindex', '-1'); // focus() を受け取れるようにする
       host.appendChild(pane);
 
       // build() 実行用の root
@@ -593,6 +635,7 @@
       tab.appendChild(badge);
       tab.appendChild(close);
       tab.addEventListener('click', () => activate(p.id));
+      _makeDraggable(tab);
       tabsEl.appendChild(tab);
       session.tab = tab;
       sessions.set(p.id, session);
@@ -601,21 +644,71 @@
       return session;
     }
 
+    // ---- タブドラッグ&ドロップ ----
+    let _dragSrc = null;
+    function _makeDraggable(tab) {
+      tab.draggable = true;
+      tab.addEventListener('dragstart', (e) => {
+        _dragSrc = tab;
+        e.dataTransfer.effectAllowed = 'move';
+        tab.classList.add('tab-dragging');
+      });
+      tab.addEventListener('dragend', () => {
+        _dragSrc = null;
+        tab.classList.remove('tab-dragging');
+        tabsEl.querySelectorAll('.tab').forEach(t => t.classList.remove('tab-drag-over'));
+      });
+      tab.addEventListener('dragover', (e) => {
+        if (!_dragSrc || _dragSrc === tab) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        tabsEl.querySelectorAll('.tab').forEach(t => t.classList.remove('tab-drag-over'));
+        tab.classList.add('tab-drag-over');
+      });
+      tab.addEventListener('dragleave', () => {
+        tab.classList.remove('tab-drag-over');
+      });
+      tab.addEventListener('drop', (e) => {
+        e.preventDefault();
+        if (!_dragSrc || _dragSrc === tab) return;
+        tab.classList.remove('tab-drag-over');
+        // DOM 上の位置を入れ替え
+        const tabs = [...tabsEl.querySelectorAll('.tab')];
+        const srcIdx = tabs.indexOf(_dragSrc);
+        const dstIdx = tabs.indexOf(tab);
+        if (srcIdx < dstIdx) {
+          tabsEl.insertBefore(_dragSrc, tab.nextSibling);
+        } else {
+          tabsEl.insertBefore(_dragSrc, tab);
+        }
+        // sessions Map の順序を DOM 順に合わせて再構築
+        const newOrder = [...tabsEl.querySelectorAll('.tab')].map(t => t.dataset.id);
+        const entries = newOrder.map(id => [id, sessions.get(id)]).filter(([, v]) => v);
+        sessions.clear();
+        entries.forEach(([id, s]) => sessions.set(id, s));
+      });
+    }
+
     window.addEventListener('resize', () => fitActive());
 
     // Ctrl+Shift+] → 次タブ / Ctrl+Shift+[ → 前タブ（Chrome に横取りされない組み合わせ）
+    // Shift+ArrowRight/Left → 次/前タブ（xterm / HTML ペイン 共通）
     document.addEventListener('keydown', e => {
-      if (e.ctrlKey && e.shiftKey && (e.key === ']' || e.key === '[')) {
-        e.preventDefault();
-        const ids = [...sessions.keys()];
-        if (ids.length > 1) {
-          const cur = ids.indexOf(activeId);
-          const next = e.key === ']'
-            ? ids[(cur + 1) % ids.length]
-            : ids[(cur - 1 + ids.length) % ids.length];
-          activate(next);
-        }
-      }
+      const isShiftArrow = e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey
+        && (e.key === 'ArrowRight' || e.key === 'ArrowLeft');
+      const isCtrlShiftBracket = e.ctrlKey && e.shiftKey
+        && (e.key === ']' || e.key === '[');
+      if (!isShiftArrow && !isCtrlShiftBracket) return;
+
+      e.preventDefault();
+      const ids = [...sessions.keys()];
+      if (ids.length <= 1) return;
+      const cur = ids.indexOf(activeId);
+      const forward = isCtrlShiftBracket ? e.key === ']' : e.key === 'ArrowRight';
+      const next = forward
+        ? ids[(cur + 1) % ids.length]
+        : ids[(cur - 1 + ids.length) % ids.length];
+      activate(next);
     });
 
     return {

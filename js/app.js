@@ -21,6 +21,9 @@
   // topology/terminal 分割リサイズ後に xterm を再フィット
   window.addEventListener('router:fit', () => tm.fitActive());
 
+  // 初期化中は onActivate での localStorage 保存を抑制するフラグ
+  let _tabSaveEnabled = false;
+
   const tm = Terminals.create({
     host: document.getElementById('term-host'),
     tabs: document.getElementById('tabs'),
@@ -38,6 +41,10 @@
       Topology.setSelected(svg, routerId);
       const node = topology.nodes.find(n => n.id === routerId);
       if (node) badge.textContent = `selected: ${node.id} (${node.os})`;
+      // 初期化完了後のみ永続化
+      if (_tabSaveEnabled) {
+        try { localStorage.setItem('virt_router:active_tab', routerId); } catch (_) {}
+      }
     },
     onCloseRequest: (routerId) => {
       tm.closeRouter(routerId);
@@ -107,9 +114,8 @@
     },
   });
 
-  // 初期: 全ルータのタブを開き、最初のルータをアクティブに
+  // 初期: 全ルータのタブを開く（activate は後の復元ブロックで行う）
   openAllTabs();
-  if (topology.nodes.length > 0) tm.activate(topology.nodes[0].id);
   updateBadge();
 
   // ----- ズームボタン -----
@@ -159,6 +165,30 @@
     ctxMenu.querySelector('.menu-title').textContent = id;
   }
 
+  // キャプチャタブ状態の永続化
+  const CAP_TABS_KEY = 'virt_router:cap_tabs';
+  function saveCapTabs() {
+    const open = [];
+    // 個別キャプチャタブ (cap:<routerId> / cap:<routerId>:<iface>)
+    topology.nodes.forEach(node => {
+      const paneId = 'cap:' + node.id;
+      if (tm.has(paneId)) open.push({ routerId: node.id, iface: null });
+      // iface フィルタ付きは captureAllSubs 外なので paneId パターンで判定困難
+      // → openCaptureTab 内で直接登録する（下記参照）
+    });
+    try { localStorage.setItem(CAP_TABS_KEY, JSON.stringify(open)); } catch (_) {}
+  }
+  // 個別タブの記録を保持する追加マップ
+  const openCapTabs = new Map(); // paneId -> { routerId, iface }
+
+  function saveCapTabsAll() {
+    const open = [...openCapTabs.values()];
+    try { localStorage.setItem(CAP_TABS_KEY, JSON.stringify(open)); } catch (_) {}
+  }
+  function loadCapTabs() {
+    try { return JSON.parse(localStorage.getItem(CAP_TABS_KEY) || '[]'); } catch (_) { return []; }
+  }
+
   function openCaptureTab(routerId, ifaceFilter) {
     if (!Capture) return;
     const paneId = ifaceFilter ? `cap:${routerId}:${ifaceFilter}` : 'cap:' + routerId;
@@ -177,12 +207,18 @@
       label,
       badge: 'CAP',
       color: '#7be17b',
-      onClose: () => Capture.unsubscribe(routerId, cb),
+      onClose: () => {
+        Capture.unsubscribe(routerId, cb);
+        openCapTabs.delete(paneId);
+        saveCapTabsAll();
+      },
       build: (root) => {
         view = window.RouterCaptureView.create(root, { routerId });
       },
     });
     Capture.subscribe(routerId, cb);
+    openCapTabs.set(paneId, { routerId, iface: ifaceFilter || null });
+    saveCapTabsAll();
   }
 
   if (ctxMenu) {
@@ -193,9 +229,15 @@
       const iface = ctxIfaceSelect ? ctxIfaceSelect.value : '';
       hideMenu();
       if (action === 'capture') openCaptureTab(id, iface || null);
-      else if (action === 'open-term') ensureTab(id);
     });
   }
+
+  // 保存済みキャプチャタブを復元（Capture・CAP_TABS_KEY・openCaptureTab が全て定義された後に実行）
+  loadCapTabs().forEach(({ routerId, iface }) => {
+    if (topology.nodes.find(n => n.id === routerId)) {
+      openCaptureTab(routerId, iface || null);
+    }
+  });
 
   // ----- ツールバー -----
   const chkEdit = document.getElementById('chk-edit');
@@ -205,6 +247,99 @@
   const btnSave = document.getElementById('btn-save');
   const btnClear = document.getElementById('btn-clear');
   const btnReset = document.getElementById('btn-reset');
+  const btnCaptureAll = document.getElementById('btn-capture-all');
+
+  // ----- 全ルータ一括キャプチャ -----
+  const CAP_ALL_KEY = 'virt_router:cap_all_active';
+  let captureAllActive = false;
+  // routerId -> { paneId, cb } のマップ
+  const captureAllSubs = new Map();
+
+  function _setCaptureAllUi(active) {
+    captureAllActive = active;
+    if (btnCaptureAll) {
+      btnCaptureAll.classList.toggle('capture-on', active);
+      btnCaptureAll.textContent = active ? '\u25a0 Capture OFF' : '\u25cf Capture';
+    }
+  }
+
+  function startCaptureAll() {
+    if (!Capture) return;
+    topology.nodes.forEach(node => {
+      if (captureAllSubs.has(node.id)) return;
+      const paneId = 'cap:all:' + node.id;
+      let view = null;
+      const cb = (line, raw, meta) => { if (view) view.append(raw, meta.ts, meta.iface); };
+      Capture.subscribe(node.id, cb);
+      if (!tm.has(paneId)) {
+        tm.openHtmlPane({
+          id: paneId,
+          label: node.id,
+          badge: 'CAP',
+          color: '#7be17b',
+          onClose: () => {
+            Capture.unsubscribe(node.id, cb);
+            captureAllSubs.delete(node.id);
+            if (captureAllSubs.size === 0) {
+              _setCaptureAllUi(false);
+              try { localStorage.removeItem(CAP_ALL_KEY); } catch (_) {}
+            }
+          },
+          build: (root) => {
+            view = window.RouterCaptureView.create(root, { routerId: node.id });
+          },
+        });
+      }
+      captureAllSubs.set(node.id, { paneId, cb });
+    });
+    if (topology.nodes.length > 0) tm.activate('cap:all:' + topology.nodes[0].id);
+    _setCaptureAllUi(true);
+    try { localStorage.setItem(CAP_ALL_KEY, '1'); } catch (_) {}
+  }
+
+  function stopCaptureAll() {
+    captureAllSubs.forEach(({ paneId, cb }, routerId) => {
+      Capture && Capture.unsubscribe(routerId, cb);
+      if (tm.has(paneId)) tm.closeRouter(paneId);
+      // パケットデータを localStorage から削除
+      try { localStorage.removeItem('virt_router:capture:' + routerId); } catch (_) {}
+    });
+    captureAllSubs.clear();
+    _setCaptureAllUi(false);
+    try { localStorage.removeItem(CAP_ALL_KEY); } catch (_) {}
+  }
+
+  if (btnCaptureAll) {
+    btnCaptureAll.addEventListener('click', () => {
+      if (captureAllActive) stopCaptureAll(); else startCaptureAll();
+    });
+  }
+
+  // 前回のアクティブタブIDを先に読んでおく（startCaptureAll が onActivate を経由して上書きする前に）
+  let _restoredActiveTab = null;
+  try { _restoredActiveTab = localStorage.getItem('virt_router:active_tab'); } catch (_) {}
+
+  // Capture All が前回アクティブだった場合は復元
+  try {
+    if (localStorage.getItem(CAP_ALL_KEY) === '1') startCaptureAll();
+  } catch (_) {}
+
+  // 前回のアクティブタブを復元（startCaptureAll による activate 上書きを打ち消す）
+  try {
+    if (_restoredActiveTab && tm.has(_restoredActiveTab)) {
+      tm.activate(_restoredActiveTab);
+    } else if (topology.nodes.length > 0) {
+      tm.activate(topology.nodes[0].id);
+    }
+  } catch (_) {}
+  // 復元完了→以降の activate を永続化有効に
+  _tabSaveEnabled = true;
+
+  // BGP セッションを自動再起動（リロードで _bgpRetryTimers が消えるため）
+  const IosXe = window.RouterIosXe;
+  if (IosXe && IosXe.restoreBgpSessions) {
+    topology.nodes.forEach(node => IosXe.restoreBgpSessions(node));
+  }
 
   // ----- pcap (ブラウザ内ストア) -----
   const Pcap = window.RouterPcap;
@@ -274,7 +409,10 @@
   btnClear.addEventListener('click', () => {
     const s = tm.getSession(tm.getActiveId());
     if (!s) return;
-    s.term.clear();
+    s.term.scrollToBottom();
+    const rows = s.term.rows || 24;
+    s.term.write('\r\n'.repeat(rows));
+    s.term.write('\x1b[H');
     s.currentLine = '';
     s.term.write(Commands.buildPrompt(s.router, s.state));
     s.term.focus();

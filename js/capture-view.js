@@ -29,8 +29,9 @@
       out.proto = 'ARP';
       out.src = ip4(pkt, 14 + 14);
       out.dst = ip4(pkt, 14 + 24);
+      const sMac = [0,1,2,3,4,5].map(i => pkt[14 + 8 + i].toString(16).padStart(2,'0')).join(':');
       out.info = op === 1 ? `Who has ${out.dst}?  Tell ${out.src}`
-               : op === 2 ? `${out.src} is at ...`
+               : op === 2 ? `${out.src} is at ${sMac}`
                : `op=${op}`;
       return out;
     }
@@ -52,8 +53,8 @@
       } else if (proto === 6) {
         const sp = u16(pkt, off), dp = u16(pkt, off + 2);
         const flags = pkt[off + 13];
-        const fmap = [['F',1],['S',2],['R',4],['P',8],['A',16],['U',32]];
-        const fStr = fmap.filter(([_,m]) => flags & m).map(([n]) => n).join('') || '.';
+        const fmap = [['FIN',1],['SYN',2],['RST',4],['PSH',8],['ACK',16],['URG',32]];
+        const fStr = fmap.filter(([_,m]) => flags & m).map(([n]) => n).join(', ') || '.';
         const dataOff = (pkt[off + 12] >> 4) * 4;
         const tcpPayload = off + dataOff;
         if ((sp === 179 || dp === 179) && tcpPayload + 19 <= pkt.length) {
@@ -61,7 +62,7 @@
           for (let i = 0; i < 16; i++) if (pkt[tcpPayload + i] !== 0xff) { isBgp = false; break; }
           if (isBgp) {
             const t = pkt[tcpPayload + 18];
-            const name = ['','OPEN','UPDATE','NOTIFICATION','KEEPALIVE'][t] || `type=${t}`;
+            const name = ['','OPEN Message','UPDATE','NOTIFICATION','KEEPALIVE'][t] || `type=${t}`;
             out.proto = 'BGP';
             out.info = name;
             return out;
@@ -154,6 +155,34 @@
     const packets = []; // {n, ts, src, dst, proto, info, bytes}
     let selectedIndex = -1;
 
+    // localStorage キー（routerId ごと）
+    const STORE_KEY = opts.routerId ? `virt_router:capture:${opts.routerId}` : null;
+
+    function _savePackets() {
+      if (!STORE_KEY) return;
+      try {
+        const data = packets.map(p => ({
+          ts: p.ts,
+          iface: p.iface,
+          b64: btoa(String.fromCharCode(...p.bytes)),
+        }));
+        localStorage.setItem(STORE_KEY, JSON.stringify(data));
+      } catch (_) {}
+    }
+
+    function _loadPackets() {
+      if (!STORE_KEY) return [];
+      try {
+        const raw = localStorage.getItem(STORE_KEY);
+        if (!raw) return [];
+        return JSON.parse(raw).map(d => ({
+          ts: d.ts,
+          iface: d.iface || null,
+          bytes: Uint8Array.from(atob(d.b64), c => c.charCodeAt(0)),
+        }));
+      } catch (_) { return []; }
+    }
+
     // root は .term-pane なので直接 .cap-view を付けると display:grid が
     // .term-pane { display:none } を上書きして非アクティブ時も表示されてしまう。
     // 内側に wrapper div を置いて絶対配置する。
@@ -168,7 +197,16 @@
         <span class="spacer"></span>
         <label>Interface: <select data-role="iface-filter"><option value="">any</option></select></label>
         <label><input type="checkbox" data-role="autoscroll" checked /> Auto scroll</label>
+        <button data-role="download">&#x2193; Download</button>
         <button data-role="clear">Clear</button>
+      </div>
+      <div class="cap-filter-bar">
+        <span class="cap-filter-label">Filter:</span>
+        <input type="text" class="cap-filter-input" data-role="filter-input"
+          placeholder="ip.src == 10.0.0.1 &amp;&amp; tcp   or   arp   or   tcp.flags.syn == 1"
+          spellcheck="false" autocomplete="off" />
+        <button data-role="filter-apply" class="cap-filter-btn">Apply</button>
+        <button data-role="filter-clear" class="cap-filter-btn" title="フィルタをクリア">&#x2715;</button>
       </div>
       <div class="cap-list" data-role="list">
         <table>
@@ -201,17 +239,64 @@
     const listEl = $('[data-role=list]');
     const autoscroll = $('[data-role=autoscroll]');
     const ifaceFilter = $('[data-role=iface-filter]');
+    const filterInput = $('[data-role=filter-input]');
     const seenIfaces = new Set();
 
-    // ---- インターフェースフィルタ ----
-    function applyIfaceFilter() {
-      const sel = ifaceFilter.value;
-      [...rowsEl.children].forEach((tr, i) => {
-        const p = packets[i];
-        tr.style.display = (!sel || p.iface === sel) ? '' : 'none';
-      });
+    // ---- ディスプレイフィルタ (Wireshark 互換) ----
+    const Filter = global.RouterCaptureFilter;
+    let _filterFn = () => true; // 現在のフィルタ関数
+
+    function _updateCount() {
+      const total = packets.length;
+      const visible = [...rowsEl.children].filter(tr => tr.style.display !== 'none').length;
+      countEl.textContent = total === visible
+        ? `${total} packet(s)`
+        : `${total} packet(s) / ${visible} displayed`;
     }
-    ifaceFilter.addEventListener('change', applyIfaceFilter);
+
+    function _rowVisible(p) {
+      const ifaceSel = ifaceFilter.value;
+      return (!ifaceSel || p.iface === ifaceSel) && _filterFn(p.bytes);
+    }
+
+    function _reapplyFilter() {
+      [...rowsEl.children].forEach((tr, i) => {
+        tr.style.display = _rowVisible(packets[i]) ? '' : 'none';
+      });
+      _updateCount();
+    }
+
+    function _compileFilter(expr) {
+      if (!Filter) return;
+      const result = Filter.compile(expr);
+      filterInput.classList.toggle('filter-error',  !result.ok);
+      filterInput.classList.toggle('filter-active', result.ok && expr.trim() !== '');
+      if (result.ok) {
+        _filterFn = result.fn;
+        _reapplyFilter();
+      }
+    }
+
+    // Enter か Apply ボタンでフィルタ適用、空欄でリセット
+    filterInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter') _compileFilter(filterInput.value);
+      if (e.key === 'Escape') { filterInput.value = ''; _compileFilter(''); filterInput.blur(); }
+    });
+    // 入力中はリアルタイムでバリデーション（表示はしない）
+    filterInput.addEventListener('input', () => {
+      if (!Filter) return;
+      const r = Filter.compile(filterInput.value);
+      filterInput.classList.toggle('filter-error',  !r.ok && filterInput.value.trim() !== '');
+      filterInput.classList.toggle('filter-active', r.ok  && filterInput.value.trim() !== '');
+    });
+    $('[data-role=filter-apply]').addEventListener('click', () => _compileFilter(filterInput.value));
+    $('[data-role=filter-clear]').addEventListener('click', () => {
+      filterInput.value = '';
+      _compileFilter('');
+    });
+
+    // ---- インターフェースフィルタ ----
+    ifaceFilter.addEventListener('change', _reapplyFilter);
 
     // ---- 3 ペイン内ドラッグリサイズ ----
     const split1El = $('[data-role=split1]');
@@ -227,7 +312,7 @@
       function onMove(ev) {
         const newList = Math.max(40, Math.min(total - 40, startList + (ev.clientY - startY)));
         wrap.style.gridTemplateRows =
-          `auto ${newList}px 4px ${total - newList}px 4px ${hexCur}px`;
+          `auto auto ${newList}px 4px ${total - newList}px 4px ${hexCur}px`;
       }
       function onUp() {
         document.removeEventListener('mousemove', onMove);
@@ -247,7 +332,7 @@
       function onMove(ev) {
         const newDetail = Math.max(30, Math.min(total - 30, startDetail + (ev.clientY - startY)));
         wrap.style.gridTemplateRows =
-          `auto ${listCur}px 4px ${newDetail}px 4px ${total - newDetail}px`;
+          `auto auto ${listCur}px 4px ${newDetail}px 4px ${total - newDetail}px`;
       }
       function onUp() {
         document.removeEventListener('mousemove', onMove);
@@ -266,6 +351,45 @@
       selectedIndex = -1;
       seenIfaces.clear();
       ifaceFilter.innerHTML = '<option value="">any</option>';
+      if (STORE_KEY) try { localStorage.removeItem(STORE_KEY); } catch (_) {}
+    });
+
+    // pcap グローバルヘッダ (24 bytes, LE, LINKTYPE_ETHERNET)
+    function buildPcapBytes(pkts) {
+      const GHDR = 24, RHDR = 16;
+      let total = GHDR;
+      pkts.forEach(p => { total += RHDR + p.bytes.length; });
+      const buf = new Uint8Array(total);
+      const dv = new DataView(buf.buffer);
+      dv.setUint32(0, 0xa1b2c3d4, true); dv.setUint16(4, 2, true); dv.setUint16(6, 4, true);
+      dv.setInt32(8, 0, true); dv.setUint32(12, 0, true);
+      dv.setUint32(16, 65535, true); dv.setUint32(20, 1, true);
+      let off = GHDR;
+      pkts.forEach(p => {
+        const sec = Math.floor(p.ts / 1000);
+        const usec = (p.ts % 1000) * 1000;
+        dv.setUint32(off,     sec,            true);
+        dv.setUint32(off + 4, usec,           true);
+        dv.setUint32(off + 8, p.bytes.length, true);
+        dv.setUint32(off + 12,p.bytes.length, true);
+        buf.set(p.bytes, off + RHDR);
+        off += RHDR + p.bytes.length;
+      });
+      return buf;
+    }
+
+    $('[data-role=download]').addEventListener('click', () => {
+      const sel = ifaceFilter.value;
+      const targets = sel ? packets.filter(p => p.iface === sel) : packets;
+      if (!targets.length) { alert('パケットがありません'); return; }
+      const bytes = buildPcapBytes(targets);
+      const blob = new Blob([bytes], { type: 'application/vnd.tcpdump.pcap' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const name = (opts.routerId || 'capture') + (sel ? '_' + sel.replace(/[^\w]/g, '_') : '');
+      a.href = url; a.download = name + '.pcap';
+      document.body.appendChild(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
     });
 
     function selectIndex(i) {
@@ -307,12 +431,12 @@
                      `<td class="c-len">${bytes.length}</td>` +
                      `<td class="c-info">${escapeHtml(s.info)}</td>`;
       tr.addEventListener('click', () => selectIndex(n - 1));
-      // 現在のフィルタで非表示にすべきか
-      const sel = ifaceFilter.value;
-      if (sel && item.iface !== sel) tr.style.display = 'none';
+      // iface フィルタ + ディスプレイフィルタ両方を適用
+      if (!_rowVisible(item)) tr.style.display = 'none';
       rowsEl.appendChild(tr);
-      countEl.textContent = `${packets.length} packet(s)`;
-      if (autoscroll && autoscroll.checked) listEl.scrollTop = listEl.scrollHeight;
+      _updateCount();
+      if (autoscroll && autoscroll.checked && tr.style.display !== 'none') listEl.scrollTop = listEl.scrollHeight;
+      _savePackets();
     }
 
     function escapeHtml(s) {
@@ -321,6 +445,12 @@
     }
 
     function destroy() { wrap.remove(); }
+
+    // 保存済みパケットを復元（自動スクロールは復元時は OFF）
+    const _prev = autoscroll.checked;
+    autoscroll.checked = false;
+    _loadPackets().forEach(d => append(d.bytes, d.ts, d.iface));
+    autoscroll.checked = _prev;
 
     return { append, destroy };
   }

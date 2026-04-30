@@ -21,10 +21,41 @@
       String(d.getMilliseconds()).padStart(3,'0');
   }
 
+  // ---------- EtherType レジストリ（追加・変更はここだけ） ----------
+  const ETYPE = {
+    0x0800: 'IPv4',
+    0x0806: 'ARP',
+    0x0842: 'Wake-on-LAN',
+    0x86DD: 'IPv6',
+    0x8100: 'VLAN (802.1Q)',
+    0x8847: 'MPLS unicast',
+    0x8848: 'MPLS multicast',
+    0x8863: 'PPPoE Discovery',
+    0x8864: 'PPPoE Session',
+    0x888E: '802.1X',
+    0x9100: 'VLAN double-tagged',
+    0x9200: 'VLAN double-tagged',
+  };
+  // EtherType 値 → 表示文字列 (例: "0x0800 (IPv4)")
+  function etypeStr(val) {
+    const hex = '0x' + val.toString(16).padStart(4, '0').toUpperCase();
+    const name = ETYPE[val];
+    return name ? `${hex} (${name})` : hex;
+  }
+
   // ---------- TCP flags ----------
   function tcpFlags(byte) {
     const map = [['F',1],['S',2],['R',4],['P',8],['A',16],['U',32]];
     return map.filter(([_,m]) => byte & m).map(([n]) => n).join('') || '.';
+  }
+
+  // MAC byte0 から IG / LG ビットを解析して文字列を返す
+  // IG bit (bit0): 0=Individual(unicast) / 1=Group(multicast/broadcast)
+  // LG bit (bit1): 0=Globally administered(OUI) / 1=Locally administered
+  function macBits(b0) {
+    const ig = b0 & 0x01;
+    const lg = (b0 >> 1) & 0x01;
+    return `IG=${ig}(${ig ? 'Group' : 'Individual'}) LG=${lg}(${lg ? 'Local' : 'Global'})`;
   }
 
   function decode(pkt) {
@@ -34,12 +65,17 @@
 
     // ARP
     if (ethertype === 0x0806) {
-      const op = u16(pkt, 14 + 6);
-      const sIp = ip4(pkt, 14 + 14);
-      const tIp = ip4(pkt, 14 + 24);
+      const op   = u16(pkt, 14 + 6);
+      const sIp  = ip4(pkt, 14 + 14);
+      const tIp  = ip4(pkt, 14 + 24);
       const sMac = mac(pkt, 14 + 8);
-      if (op === 1) return `ARP  Who has ${tIp}?  Tell ${sIp}  (${total}B)`;
-      if (op === 2) return `ARP  ${sIp} is at ${sMac}  (${total}B)`;
+      const bits = macBits(pkt[14 + 8]);
+      const isGarp = op === 1 && sIp === tIp;
+      if (op === 1) {
+        const prefix = isGarp ? `GARP [${bits}]  ${sIp}` : `ARP  Who has ${tIp}?  Tell ${sIp}`;
+        return `${prefix}  (${total}B)`;
+      }
+      if (op === 2) return `ARP  ${sIp} is at ${sMac} [${bits}]  (${total}B)`;
       return `ARP  op=${op}  (${total}B)`;
     }
 
@@ -95,7 +131,7 @@
       return `IP   ${pad(src,15)} > ${pad(dst,15)}  proto=${proto} (${total}B)`;
     }
 
-    return `Ethernet type=0x${ethertype.toString(16).padStart(4,'0')} (${total}B)`;
+    return `Ethernet type=${etypeStr(ethertype)} (${total}B)`;
   }
 
   function format(routerId, pkt, when) {
@@ -115,9 +151,13 @@
   function ethTree(pkt) {
     const dst = mac(pkt, 0), src = mac(pkt, 6), et = u16(pkt, 12);
     return fld(`Ethernet II, Src: ${src}, Dst: ${dst}`, 0, 14, [
-      fld(`Destination: ${dst}`, 0, 6),
-      fld(`Source: ${src}`, 6, 6),
-      fld(`Type: 0x${et.toString(16).padStart(4,'0')}`, 12, 2),
+      fld(`Destination: ${dst}`, 0, 6, [
+        fld(macBits(pkt[0]), 0, 1),
+      ]),
+      fld(`Source: ${src}`, 6, 6, [
+        fld(macBits(pkt[6]), 6, 1),
+      ]),
+      fld(`Type: ${etypeStr(et)}`, 12, 2),
     ]);
   }
 
@@ -150,10 +190,10 @@
     const tMac = mac(pkt, off + 18), tIp = ip4(pkt, off + 24);
     return fld(`Address Resolution Protocol (${op === 1 ? 'request' : op === 2 ? 'reply' : 'op='+op})`, off, 28, [
       fld(`Hardware type: Ethernet (1)`, off, 2),
-      fld(`Protocol type: IPv4 (0x0800)`, off + 2, 2),
+      fld(`Protocol type: ${etypeStr(0x0800)}`, off + 2, 2),
       fld(`Hardware size: 6`, off + 4, 1),
       fld(`Protocol size: 4`, off + 5, 1),
-      fld(`Opcode: ${op}`, off + 6, 2),
+      fld(`Opcode: ${op} (${op === 1 ? 'request' : op === 2 ? 'reply' : 'unknown'})`, off + 6, 2),
       fld(`Sender MAC: ${sMac}`, off + 8, 6),
       fld(`Sender IP:  ${sIp}`, off + 14, 4),
       fld(`Target MAC: ${tMac}`, off + 18, 6),

@@ -43,6 +43,8 @@ body {
 }
 #toolbar button:hover { background: #1f4fa8; }
 #toolbar button.active { background: #e07b00; }
+#toolbar button.capture-on { background: #27ae60; }
+#toolbar button.capture-on:hover { background: #1e8449; }
 #toolbar button.danger { background: #c0392b; }
 #toolbar button.danger:hover { background: #962d22; }
 #toolbar .spacer { flex: 1 1 auto; }
@@ -215,6 +217,8 @@ body.tool-delete    #topo-svg { cursor: not-allowed; }
   color: #8aa0c8;
 }
 .tab.active .tab-os { color: #cfe1ff; }
+.tab-dragging { opacity: 0.4; cursor: grabbing; }
+.tab-drag-over { border-left: 2px solid #ffd866; }
 
 /* xterm 各ペイン（ルータごとに1つ） */
 #term-host {
@@ -299,7 +303,7 @@ body.tool-delete    #topo-svg { cursor: not-allowed; }
   position: absolute;
   inset: 0;
   display: grid;
-  grid-template-rows: auto 2fr 4px 1fr 4px 1fr;
+  grid-template-rows: auto auto 155px 4px 2fr 4px 1fr;
   font-family: ui-monospace, Menlo, Consolas, monospace;
   font-size: 12px;
   background: #0e1116;
@@ -325,6 +329,49 @@ body.tool-delete    #topo-svg { cursor: not-allowed; }
   font-size: 11px;
 }
 .cap-toolbar button:hover { background: #1f4fa8; }
+
+/* ----- Wireshark フィルタバー ----- */
+.cap-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: #131820;
+  border-bottom: 1px solid #000;
+  font-family: system-ui, sans-serif;
+  font-size: 12px;
+}
+.cap-filter-label {
+  color: #8aa0c8;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.cap-filter-input {
+  flex: 1 1 0;
+  background: #0e1116;
+  color: #e6e6e6;
+  border: 1px solid #444;
+  border-radius: 3px;
+  padding: 3px 8px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+.cap-filter-input:focus  { border-color: #2d6cdf; }
+.cap-filter-input.filter-active { border-color: #4caf50; background: #0a1f0e; }
+.cap-filter-input.filter-error  { border-color: #e53935; background: #1f0a0a; }
+.cap-filter-btn {
+  padding: 2px 8px;
+  background: #2a2f3d;
+  color: #cfe1ff;
+  border: 1px solid #444;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.cap-filter-btn:hover { background: #3a4460; }
 
 .cap-list {
   overflow: auto;
