@@ -435,6 +435,50 @@
     return { areas };
   }
 
+  function getSrConfig(cfg) {
+    const lines = (cfg || '').split('\n');
+
+    // Check for SRGB configuration
+    let srEnabled = false, srgbBase = 16000, srgbEnd = 23999;
+    let igpType = null;
+
+    for (const l of lines) {
+      // set protocols isis source-packet-routing srgb start-label N index-range M
+      const srgbM = l.match(/^set protocols isis source-packet-routing srgb start-label\s+(\d+)\s+index-range\s+(\d+)/i);
+      if (srgbM) {
+        srgbBase = parseInt(srgbM[1]);
+        srgbEnd = srgbBase + parseInt(srgbM[2]) - 1;
+        srEnabled = true;
+        igpType = 'isis';
+        continue;
+      }
+      // set protocols isis source-packet-routing (without srgb → SR enabled with defaults)
+      if (/^set protocols isis source-packet-routing\b/i.test(l)) {
+        srEnabled = true;
+        igpType = 'isis';
+        continue;
+      }
+    }
+
+    if (!srEnabled) return null;
+
+    // Collect prefix-sids from loopback interfaces
+    // set protocols isis interface lo0.0 level 2 prefix-sid index N
+    const prefixSids = {};
+    const ifaces = getInterfaces(cfg);
+    for (const l of lines) {
+      const m = l.match(/^set protocols isis interface\s+(\S+)\s+level\s+\d+\s+prefix-sid\s+index\s+(\d+)/i);
+      if (!m) continue;
+      const ifName = m[1];
+      const index = parseInt(m[2]);
+      // Find IP for this interface
+      const iface = ifaces.find(f => f.name === ifName || f.name === ifName.replace(/\.0$/, ''));
+      if (iface) prefixSids[`${iface.ip}/32`] = index;
+    }
+
+    return { srEnabled, igpType, srgb: { base: srgbBase, end: srgbEnd }, prefixSids };
+  }
+
   function getMplsConfig(cfg) {
     const lines = (cfg || '').split('\n');
     const mpls = new Set(), ldp = new Set();
@@ -613,9 +657,29 @@
       }
       if (proto === 'isis') {
         const isisRest = rest.slice(1);
+        // source-packet-routing (SR) commands
+        if ((isisRest[0] || '').toLowerCase() === 'source-packet-routing') {
+          const sprest = isisRest.slice(1);
+          if (sprest[0] === 'srgb' && sprest[1] === 'start-label' && sprest[2] && sprest[3] === 'index-range' && sprest[4]) {
+            _deleteLines(router, /^set protocols isis source-packet-routing srgb/i);
+            _setLine(router, `set protocols isis source-packet-routing srgb start-label ${sprest[2]} index-range ${sprest[4]}`);
+          } else {
+            _setLine(router, `set protocols isis source-packet-routing${sprest.length ? ' ' + sprest.join(' ') : ''}`);
+          }
+          if (window.RouterSr) window.RouterSr.recalculate();
+          return true;
+        }
         if ((isisRest[0] || '').toLowerCase() === 'interface') {
           const ifname = isisRest[1];
           if (!ifname) { io.println('% Incomplete: interface name required'); return true; }
+          // prefix-sid index N (SR)
+          const irest = isisRest.slice(2);
+          if (irest[0] === 'level' && irest[1] && irest[2] === 'prefix-sid' && irest[3] === 'index' && irest[4]) {
+            _deleteLines(router, new RegExp(`^set protocols isis interface ${ifname.replace(/\./g,'\\.')} level ${irest[1]} prefix-sid`, 'i'));
+            _setLine(router, `set protocols isis interface ${ifname} level ${irest[1]} prefix-sid index ${irest[4]}`);
+            if (window.RouterSr) window.RouterSr.recalculate();
+            return true;
+          }
           const isisKey = isisRest.slice(2).join(' ');
           if (isisKey) {
             _deleteLines(router, new RegExp(`^set protocols isis interface ${ifname.replace(/\//g,'\\/')}\\s*$`, 'i'));
@@ -764,9 +828,26 @@
       }
       if (proto === 'isis') {
         const isisRest = rest.slice(1);
+        // delete protocols isis source-packet-routing
+        if ((isisRest[0] || '').toLowerCase() === 'source-packet-routing') {
+          if (isisRest[1] === 'srgb') {
+            _deleteLines(router, /^set protocols isis source-packet-routing srgb\s+/i);
+          } else {
+            _deleteLines(router, /^set protocols isis source-packet-routing/i);
+          }
+          if (window.RouterSr) window.RouterSr.recalculate();
+          return true;
+        }
         if ((isisRest[0] || '').toLowerCase() === 'interface') {
           if (isisRest[1]) {
             const ifname = isisRest[1];
+            // delete protocols isis interface <name> level <L> prefix-sid
+            const irest = isisRest.slice(2);
+            if (irest[0] === 'level' && irest[1] && irest[2] === 'prefix-sid') {
+              _deleteLines(router, new RegExp(`^set protocols isis interface ${ifname.replace(/\./g,'\\.')} level ${irest[1]} prefix-sid`, 'i'));
+              if (window.RouterSr) window.RouterSr.recalculate();
+              return true;
+            }
             _deleteLines(router, new RegExp(`^set protocols isis interface ${ifname.replace(/\//g,'\\/')}(\\s+.*)?$`, 'i'));
           } else {
             _deleteLines(router, /^set protocols isis interface\s+/i);
@@ -856,7 +937,7 @@
       if (verb === 'top') { return true; } // already at top
 
       if (verb === 'show') {
-        const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances','ldp'];
+        const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances','ldp','spring-te'];
         const sub = _ex(parts[1], _SHOW_J);
         if (!sub || sub === '|' || sub === 'all') { showConfig(router, io); return true; }
         // show interfaces etc. from config mode
@@ -909,7 +990,7 @@
     }
 
     if (verb === 'show') {
-      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances','ldp'];
+      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances','ldp','spring-te'];
       const sub = _ex(parts[1], _SHOW_J);
       if (sub === 'interfaces' || sub === 'interface') {
         showInterfaces(parts.slice(2), router, io); return true;
@@ -933,6 +1014,22 @@
               io.println(`${e.inLabel}                 *[LDP/9] 00:01:00, metric 1`);
               const actionStr = e.action === 'pop' ? 'Pop' : `Swap ${e.outLabel}`;
               io.println(`                    > to ${e.nexthop} via ${e.iface}, ${actionStr}`);
+            });
+            return true;
+          }
+          if (tableName.toLowerCase() === 'inet.3') {
+            if (!window.RouterSr) { io.println('% Segment Routing not initialized'); return true; }
+            const entries = window.RouterSr.getSrLfib(router.id);
+            const count = entries.length;
+            io.println(`inet.3: ${count} destinations, ${count} routes (${count} active, 0 holddown, 0 hidden)`);
+            io.println('');
+            io.println('+ = Active Route, - = Last Active, * = Both');
+            io.println('');
+            if (entries.length === 0) { io.println('(no SR forwarding entries)'); return true; }
+            entries.forEach(e => {
+              const actionStr = e.action === 'pop' ? 'Pop' : `Swap ${e.outLabel}`;
+              io.println(`${e.prefix}  *[SPRING-TE/9] 00:01:00`);
+              io.println(`                > to ${e.nexthop} via ${e.iface}, ${actionStr}`);
             });
             return true;
           }
@@ -1050,7 +1147,18 @@
         return true;
       }
       if (sub === 'isis') {
-        const sub2 = _ex(parts[2] || 'adjacency', ['adjacency','database']);
+        const sub2 = _ex(parts[2] || 'adjacency', ['adjacency','database','spring-adjacencies']);
+        if (sub2 === 'spring-adjacencies') {
+          if (!window.RouterSr) { io.println('% Segment Routing not initialized'); return true; }
+          const entries = window.RouterSr.getSrLfib(router.id);
+          io.println('SPRING Adjacency Database:');
+          io.println('Interface         Neighbor          Label');
+          entries.forEach(e => {
+            io.println(`${(e.iface||'-').padEnd(18)}${e.nexthop.padEnd(18)}${e.inLabel}`);
+          });
+          if (entries.length === 0) io.println(' (none)');
+          return true;
+        }
         if (sub2 === 'adjacency') {
           const adjs = RouterIsis.getAdjacencies(router.id);
           io.println('IS-IS adjacency database:');
@@ -1081,6 +1189,13 @@
           io.println(inst.name.padEnd(23) + 'vrf'.padEnd(16) + (inst.rd || 'not set').padEnd(22) + inst.ifaces.join(', '));
         });
         if (insts.length === 0) io.println('(no routing instances configured)');
+        return true;
+      }
+      // show spring-te label-range
+      if (sub === 'spring-te') {
+        if (!window.RouterSr) { io.println('% Segment Routing not initialized'); return true; }
+        const blk = window.RouterSr.getSrLabelBlock(router.id);
+        io.println(`Label range: ${blk.base} - ${blk.end}`);
         return true;
       }
       io.println(`% Unknown show command: ${sub}`);
@@ -1277,6 +1392,16 @@
   if (window.RouterMpls) {
     window.RouterMpls.registerOsParser('junos', {
       getMplsConfig,
+      getInterfaceList(cfg) {
+        return getInterfaces(cfg).map(f => ({ name: f.name, ip: f.ip, mask: f.mask }));
+      },
+    });
+  }
+
+  // SR パーサ登録
+  if (window.RouterSr) {
+    window.RouterSr.registerOsParser('junos', {
+      getSrConfig,
       getInterfaceList(cfg) {
         return getInterfaces(cfg).map(f => ({ name: f.name, ip: f.ip, mask: f.mask }));
       },

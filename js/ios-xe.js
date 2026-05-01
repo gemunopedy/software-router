@@ -625,6 +625,41 @@
     io.println(`% Invalid input after 'show mpls'`);
   };
 
+  showHandlers['segment-routing'] = (args, router, io) => {
+    if (!window.RouterSr) { io.println('% Segment Routing not initialized'); return; }
+    const sub = _ex(args[0] || 'mpls', ['mpls']);
+    if (sub !== 'mpls') { io.println(`% Invalid input after 'show segment-routing'`); return; }
+    const sub2 = _ex(args[1] || 'lb', ['lb','connected-prefix-sid-map','forwarding']);
+    if (sub2 === 'lb') {
+      const blk = window.RouterSr.getSrLabelBlock(router.id);
+      io.println('SR Label Block (SRGB):');
+      io.println(`  Range: ${blk.base} - ${blk.end}`);
+      return;
+    }
+    if (sub2 === 'connected-prefix-sid-map') {
+      const state2 = window.RouterSr.getSrState(router.id);
+      const sids = Object.entries(state2.prefixSids || {});
+      io.println('Prefix/Mask     Index  Label');
+      if (sids.length === 0) { io.println('  (none)'); return; }
+      sids.forEach(([prefix, index]) => {
+        const label = state2.srgb.base + index;
+        io.println(`${prefix.padEnd(16)}${String(index).padEnd(7)}${label}`);
+      });
+      return;
+    }
+    if (sub2 === 'forwarding') {
+      const entries = window.RouterSr.getSrLfib(router.id);
+      io.println('Prefix/Mask     In-Label  Out-Label  Next-Hop      Interface');
+      if (entries.length === 0) { io.println('  (empty)'); return; }
+      entries.forEach(e => {
+        const outStr = e.action === 'pop' ? 'Pop' : String(e.outLabel);
+        io.println(`${e.prefix.padEnd(16)}${String(e.inLabel).padEnd(10)}${outStr.padEnd(11)}${e.nexthop.padEnd(14)}${e.iface}`);
+      });
+      return;
+    }
+    io.println(`% Invalid input after 'show segment-routing mpls'`);
+  };
+
   showHandlers['vrf'] = (args, router, io) => {
     const cfg = readCfg(router);
     const vrfs = getVrfDefinitions(cfg);
@@ -766,6 +801,40 @@
     }
     return null;
   }
+  function getSrConfig(cfg) {
+    const srEnabled = /^segment-routing\s+mpls\s*$/im.test(cfg || '');
+    if (!srEnabled) return null;
+
+    let igpType = null;
+    const lines = (cfg || '').split('\n');
+    let inIsis = false, inOspf = false;
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (/^router\s+isis/i.test(t)) { inIsis = true; inOspf = false; continue; }
+      if (/^router\s+ospf/i.test(t)) { inOspf = true; inIsis = false; continue; }
+      if (/^[^ \t!]/.test(t) && t !== '') { inIsis = false; inOspf = false; continue; }
+      if (inIsis && /^\s+segment-routing\s+mpls\s*$/i.test(t)) { igpType = 'isis'; }
+      if (inOspf && /^\s+segment-routing\s+mpls\s*$/i.test(t)) { igpType = 'ospf'; }
+    }
+
+    // Collect prefix-sids from loopback interfaces
+    const prefixSids = {};
+    const ifBlocks = parseInterfaces(cfg || '');
+    for (const blk of ifBlocks) {
+      if (!/^loopback/i.test(blk.name)) continue;
+      const ipInfo = getIfIp(blk);
+      if (!ipInfo) continue;
+      for (const l of blk.lines) {
+        const m = l.match(/^(?:isis|ospf)\s+prefix-sid\s+index\s+(\d+)/i);
+        if (m) {
+          prefixSids[`${ipInfo.ip}/32`] = parseInt(m[1]);
+        }
+      }
+    }
+
+    return { srEnabled, igpType, srgb: { base: 16000, end: 23999 }, prefixSids };
+  }
+
   function getMplsConfig(cfg) {
     const ifaces = parseInterfaces(cfg);
     const ldpRidM = (cfg || '').match(/^mpls ldp router-id\s+(\S+)/im);
@@ -1242,6 +1311,35 @@
           return true;
         }
 
+        // isis prefix-sid index <N>  (loopback only)
+        if (/^isis$/i.test(verb) && _ex(parts[1], ['prefix-sid']) === 'prefix-sid' && _ex(parts[2], ['index']) === 'index') {
+          const n = parts[3];
+          if (!n || isNaN(+n)) { io.println('% Incomplete: index value required'); return true; }
+          _updateIfaceLine(router, ifaceName, /^isis prefix-sid\s+/i, `isis prefix-sid index ${n}`);
+          if (window.RouterSr) window.RouterSr.recalculate();
+          return true;
+        }
+        // no isis prefix-sid
+        if (verb === 'no' && /^isis$/i.test(parts[1] || '') && _ex(parts[2], ['prefix-sid']) === 'prefix-sid') {
+          _removeIfaceLine(router, ifaceName, /^isis prefix-sid\s+/i);
+          if (window.RouterSr) window.RouterSr.recalculate();
+          return true;
+        }
+        // ospf prefix-sid index <N>  (loopback only)
+        if (/^ospf$/i.test(verb) && _ex(parts[1], ['prefix-sid']) === 'prefix-sid' && _ex(parts[2], ['index']) === 'index') {
+          const n = parts[3];
+          if (!n || isNaN(+n)) { io.println('% Incomplete: index value required'); return true; }
+          _updateIfaceLine(router, ifaceName, /^ospf prefix-sid\s+/i, `ospf prefix-sid index ${n}`);
+          if (window.RouterSr) window.RouterSr.recalculate();
+          return true;
+        }
+        // no ospf prefix-sid
+        if (verb === 'no' && /^ospf$/i.test(parts[1] || '') && _ex(parts[2], ['prefix-sid']) === 'prefix-sid') {
+          _removeIfaceLine(router, ifaceName, /^ospf prefix-sid\s+/i);
+          if (window.RouterSr) window.RouterSr.recalculate();
+          return true;
+        }
+
         io.println(`% Invalid input in config-if mode: ${parts.join(' ')}`);
         return true;
       }
@@ -1281,6 +1379,16 @@
             _updateRouterLine(router, procKey, /^router-id\s+/i, `router-id ${rid}`);
             return true;
           }
+          if (verb === 'segment-routing' && _ex(parts[1], ['mpls']) === 'mpls') {
+            _updateRouterLine(router, procKey, /^segment-routing\s+mpls\s*$/i, 'segment-routing mpls');
+            if (window.RouterSr) window.RouterSr.recalculate();
+            return true;
+          }
+          if (verb === 'no' && _ex(parts[1], ['network','router-id','segment-routing']) === 'segment-routing') {
+            _removeRouterLine(router, procKey, /^segment-routing\s+mpls\s*$/i);
+            if (window.RouterSr) window.RouterSr.recalculate();
+            return true;
+          }
           io.println(`% Invalid input in config-router-ospf: ${parts.join(' ')}`);
           return true;
         }
@@ -1301,10 +1409,16 @@
             RouterIsis.recalculate(router.id);
             return true;
           }
+          if (verb === 'segment-routing' && _ex(parts[1], ['mpls']) === 'mpls') {
+            _updateRouterLine(router, procKey, /^segment-routing\s+mpls\s*$/i, 'segment-routing mpls');
+            if (window.RouterSr) window.RouterSr.recalculate();
+            return true;
+          }
           if (verb === 'no') {
-            const sub = _ex(parts[1], ['net','is-type']);
+            const sub = _ex(parts[1], ['net','is-type','segment-routing']);
             if (sub === 'net') { _removeRouterLine(router, procKey, /^net\s+/i); RouterIsis.recalculate(router.id); return true; }
             if (sub === 'is-type') { _removeRouterLine(router, procKey, /^is-type\s+/i); RouterIsis.recalculate(router.id); return true; }
+            if (sub === 'segment-routing') { _removeRouterLine(router, procKey, /^segment-routing\s+mpls\s*$/i); if (window.RouterSr) window.RouterSr.recalculate(); return true; }
           }
           io.println(`% Invalid input in config-router-isis: ${parts.join(' ')}`);
           return true;
@@ -1643,6 +1757,23 @@
         return true;
       }
 
+      // segment-routing mpls
+      if (verb === 'segment-routing' && _ex(parts[1], ['mpls']) === 'mpls') {
+        const cfg2 = Storage.read(router.id, 'running') || '';
+        if (!/^segment-routing\s+mpls\s*$/im.test(cfg2)) {
+          Storage.write(router.id, 'running', cfg2.trimEnd() + '\nsegment-routing mpls\n');
+        }
+        if (window.RouterSr) window.RouterSr.recalculate();
+        return true;
+      }
+      // no segment-routing mpls
+      if (verb === 'no' && _ex(parts[1], ['segment-routing']) === 'segment-routing') {
+        const cfg2 = Storage.read(router.id, 'running') || '';
+        Storage.write(router.id, 'running', cfg2.replace(/^segment-routing\s+mpls\s*\n?/im, ''));
+        if (window.RouterSr) window.RouterSr.recalculate();
+        return true;
+      }
+
       io.println(`% Invalid input in config mode: ${parts.join(' ')}`);
       return true;
     }
@@ -1670,7 +1801,7 @@
 
     // --- show ---
     if (verb === 'show' || verb === 'sh') {
-      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','ip','arp','interfaces','ospf','clock','history','isis','clns','vrf','mpls'];
+      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','ip','arp','interfaces','ospf','clock','history','isis','clns','vrf','mpls','segment-routing'];
       const sub = _ex(parts[1], _SHOW_KEYS);
       if (!sub) {
         io.println('% Incomplete command. Type "show ?" for help.');
@@ -2100,8 +2231,22 @@
     });
   }
 
-  // すべての OS パーサが登録されたあとに IS-IS / OSPF / MPLS ルートを復元する
-  setTimeout(() => { RouterIsis.restoreAll(); RouterOspf.restoreAll(); if (window.RouterMpls) window.RouterMpls.restoreAll(); }, 0);
+  // SR パーサ登録
+  if (window.RouterSr) {
+    window.RouterSr.registerOsParser('ios-xe', {
+      getSrConfig,
+      getInterfaceList(cfg) {
+        return parseInterfaces(cfg).map(blk => ({
+          name: blk.name,
+          ip: getIfaceIp(blk),
+          mask: getIfaceMask(blk),
+        })).filter(f => f.ip);
+      },
+    });
+  }
+
+  // すべての OS パーサが登録されたあとに IS-IS / OSPF / MPLS / SR ルートを復元する
+  setTimeout(() => { RouterIsis.restoreAll(); RouterOspf.restoreAll(); if (window.RouterMpls) window.RouterMpls.restoreAll(); if (window.RouterSr) window.RouterSr.restoreAll(); }, 0);
 
   global.RouterIosXe = { handleCommand, complete, restoreBgpSessions };
 })(window);
