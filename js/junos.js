@@ -232,23 +232,39 @@
     io.println('');
     io.println('inet.0: routes');
     io.println('');
+
+    // すべてのルート候補を収集
+    const candidates = [];
     ifaces.forEach(f => {
-      const netOcts = f.ip.split('.').map(Number);
+      const netOcts  = f.ip.split('.').map(Number);
       const maskOcts = f.mask.split('.').map(Number);
       const net = netOcts.map((b, i) => b & maskOcts[i]).join('.');
-      io.println(`${net}/${f.prefixLen}            *[Direct/0] preference 0`);
-      io.println(`                    > via ${f.name}`);
-      io.println(`${f.ip}/32              *[Local/0] preference 0`);
-      io.println(`                      Local via ${f.name}`);
-    });
-    const bgpRoutes = RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self');
-    bgpRoutes.forEach(e => {
-      io.println(`${e.prefix}/${e.prefixLen}     *[BGP/${e.asPath.join(' ')}]`);
-      io.println(`                    > to ${e.nextHop}`);
+      candidates.push({ type: 'Direct', prefix: net,  prefixLen: f.prefixLen, ad: 0, metric: 0, via: f.name });
+      candidates.push({ type: 'Local',  prefix: f.ip, prefixLen: 32,          ad: 0, metric: 0, via: f.name });
     });
     getStaticRoutes(cfg).forEach(e => {
-      io.println(`${e.prefix}/${e.prefixLen}       *[Static/${e.ad}] preference ${e.ad}`);
-      io.println(`                    > to ${e.nexthop}`);
+      candidates.push({ type: 'Static', prefix: e.prefix, prefixLen: e.prefixLen, ad: e.ad, metric: 0, nexthop: e.nexthop });
+    });
+    RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self').forEach(e => {
+      candidates.push({ type: 'BGP', prefix: e.prefix, prefixLen: e.prefixLen, ad: 20, metric: 0, nexthop: e.nextHop, asPath: e.asPath });
+    });
+
+    // AD選択後の best-route のみ表示
+    RouterRib.selectBest(candidates).forEach(r => {
+      if (r.type === 'Direct') {
+        io.println(`${r.prefix}/${r.prefixLen}            *[Direct/0] preference 0`);
+        io.println(`                    > via ${r.via}`);
+      } else if (r.type === 'Local') {
+        io.println(`${r.prefix}/${r.prefixLen}              *[Local/0] preference 0`);
+        io.println(`                      Local via ${r.via}`);
+      } else if (r.type === 'Static') {
+        io.println(`${r.prefix}/${r.prefixLen}       *[Static/${r.ad}] preference ${r.ad}`);
+        io.println(`                    > to ${r.nexthop}`);
+      } else if (r.type === 'BGP') {
+        const path = r.asPath ? r.asPath.join(' ') : '';
+        io.println(`${r.prefix}/${r.prefixLen}     *[BGP/20] preference 20 AS path: ${path}`);
+        io.println(`                    > to ${r.nexthop}`);
+      }
     });
   }
 

@@ -439,26 +439,33 @@
 
   showHandlers['route'] = (args, router, io) => {
     const cfg = Storage.read(router.id, 'running') || Storage.read(router.id, 'startup') || '';
-    io.println('Codes: C - connected, L - local, B - BGP');
+    io.println('Codes: C - connected, L - local, S - static, B - BGP');
     io.println('');
-    const ifaces = parseInterfaces(cfg);
-    ifaces.forEach(blk => {
+
+    const candidates = [];
+    parseInterfaces(cfg).forEach(blk => {
       if (isIfShutdown(blk)) return;
       const ipInfo = getIfIpInfo(blk);
       if (!ipInfo) return;
-      const ipParts = ipInfo.ip.split('.').map(Number);
+      const ipParts   = ipInfo.ip.split('.').map(Number);
       const maskParts = ipInfo.mask.split('.').map(Number);
       const net = ipParts.map((b, i) => b & maskParts[i]).join('.');
       const len = _maskToPrefix(ipInfo.mask);
-      io.println(`C     ${net}/${len} is directly connected, ${blk.name}`);
-      io.println(`L     ${ipInfo.ip}/32 is directly connected, ${blk.name}`);
-    });
-    const bgpRoutes = RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self');
-    bgpRoutes.forEach(e => {
-      io.println(`B     ${e.prefix}/${e.prefixLen} [20/0] via ${e.nextHop}`);
+      candidates.push({ type: 'C', prefix: net,       prefixLen: len, ad: 0, metric: 0, via: blk.name });
+      candidates.push({ type: 'L', prefix: ipInfo.ip, prefixLen: 32,  ad: 0, metric: 0, via: blk.name });
     });
     getStaticRoutes(cfg).forEach(e => {
-      io.println(`S     ${e.prefix}/${e.prefixLen} [${e.ad}/0] via ${e.nexthop}`);
+      candidates.push({ type: 'S', prefix: e.prefix, prefixLen: e.prefixLen, ad: e.ad, metric: 0, nexthop: e.nexthop });
+    });
+    RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self').forEach(e => {
+      candidates.push({ type: 'B', prefix: e.prefix, prefixLen: e.prefixLen, ad: 20, metric: 0, nexthop: e.nextHop });
+    });
+
+    RouterRib.selectBest(candidates).forEach(r => {
+      if (r.type === 'C') io.println(`C     ${r.prefix}/${r.prefixLen} is directly connected, ${r.via}`);
+      else if (r.type === 'L') io.println(`L     ${r.prefix}/${r.prefixLen} is directly connected, ${r.via}`);
+      else if (r.type === 'S') io.println(`S     ${r.prefix}/${r.prefixLen} [${r.ad}/0] via ${r.nexthop}`);
+      else if (r.type === 'B') io.println(`B     ${r.prefix}/${r.prefixLen} [20/0] via ${r.nexthop}`);
     });
   };
 

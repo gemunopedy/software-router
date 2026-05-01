@@ -270,29 +270,36 @@
     }
 
     if (sub === 'route') {
-      // show ip route (簡易)
+      // show ip route – AD選択ベース
       io.println('Codes: C - connected, S - static, R - RIP, M - mobile, B - BGP');
       io.println('       D - EIGRP, EX - EIGRP external, O - OSPF, ...');
       io.println('');
       io.println('Gateway of last resort is not set');
       io.println('');
+
+      const candidates = [];
       parseInterfaces(cfg).forEach(iface => {
         const ipInfo = getIfIp(iface);
         if (!ipInfo) return;
-        const prefix = maskToPrefix(ipInfo.mask);
-        // ネットワークアドレスを計算
-        const ipParts = ipInfo.ip.split('.').map(Number);
+        const prefixLen = maskToPrefix(ipInfo.mask);
+        const ipParts  = ipInfo.ip.split('.').map(Number);
         const maskParts = ipInfo.mask.split('.').map(Number);
         const net = ipParts.map((b, i) => b & maskParts[i]).join('.');
-        io.println(`C     ${net}/${prefix} is directly connected, ${iface.name}`);
-        io.println(`L     ${ipInfo.ip}/32 is directly connected, ${iface.name}`);
-      });
-      const bgpRoutes = RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self');
-      bgpRoutes.forEach(e => {
-        io.println(`B     ${e.prefix}/${e.prefixLen} [20/0] via ${e.nextHop}, 00:00:00`);
+        candidates.push({ type: 'C', prefix: net,      prefixLen, ad: 0, metric: 0, via: iface.name });
+        candidates.push({ type: 'L', prefix: ipInfo.ip, prefixLen: 32, ad: 0, metric: 0, via: iface.name });
       });
       getStaticRoutes(cfg).forEach(e => {
-        io.println(`S     ${e.prefix}/${maskToPrefix(e.mask)} [${e.ad}/0] via ${e.nexthop}`);
+        candidates.push({ type: 'S', prefix: e.prefix, prefixLen: maskToPrefix(e.mask), ad: e.ad, metric: 0, nexthop: e.nexthop });
+      });
+      RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self').forEach(e => {
+        candidates.push({ type: 'B', prefix: e.prefix, prefixLen: e.prefixLen, ad: 20, metric: 0, nexthop: e.nextHop });
+      });
+
+      RouterRib.selectBest(candidates).forEach(r => {
+        if (r.type === 'C') io.println(`C     ${r.prefix}/${r.prefixLen} is directly connected, ${r.via}`);
+        else if (r.type === 'L') io.println(`L     ${r.prefix}/${r.prefixLen} is directly connected, ${r.via}`);
+        else if (r.type === 'S') io.println(`S     ${r.prefix}/${r.prefixLen} [${r.ad}/0] via ${r.nexthop}`);
+        else if (r.type === 'B') io.println(`B     ${r.prefix}/${r.prefixLen} [20/0] via ${r.nexthop}, 00:00:00`);
       });
       return;
     }
