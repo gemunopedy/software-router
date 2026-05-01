@@ -108,8 +108,17 @@
       if (state && state.configMode === 'global') return host + '(config)# ';
       return host + '# ';
     }
-    if (router.os === 'junos') return 'root@' + host + '> ';
-    return 'RP/0/RP0/CPU0:' + host + '# ';
+    if (router.os === 'ios-xr') {
+      if (state && state.configMode === 'if')     return 'RP/0/RP0/CPU0:' + host + '(config-if)# ';
+      if (state && state.configMode === 'router') return 'RP/0/RP0/CPU0:' + host + '(config-bgp)# ';
+      if (state && state.configMode === 'global') return 'RP/0/RP0/CPU0:' + host + '(config)# ';
+      return 'RP/0/RP0/CPU0:' + host + '# ';
+    }
+    if (router.os === 'junos') {
+      if (state && state.configMode === 'edit') return 'root@' + host + '# ';
+      return 'root@' + host + '> ';
+    }
+    return host + '# ';
   }
 
   function verifyStartupConfig(cfg) {
@@ -171,6 +180,18 @@
     // IOS-XE は専用モジュールへ委譲
     if (router.os === 'ios-xe' && global.RouterIosXe) {
       const handled = global.RouterIosXe.handleCommand(parts, state, io);
+      if (handled) return;
+    }
+
+    // IOS-XR は専用モジュールへ委譲
+    if (router.os === 'ios-xr' && global.RouterIosXr) {
+      const handled = global.RouterIosXr.handleCommand(parts, state, io);
+      if (handled) return;
+    }
+
+    // JunOS は専用モジュールへ委譲
+    if (router.os === 'junos' && global.RouterJunos) {
+      const handled = global.RouterJunos.handleCommand(parts, state, io);
       if (handled) return;
     }
 
@@ -488,7 +509,13 @@
     if (router.os === 'ios-xe' && global.RouterIosXe && global.RouterIosXe.complete) {
       return global.RouterIosXe.complete(line, router, state);
     }
-    // IOS-XR / Junos: 共通の最小補完
+    if (router.os === 'ios-xr' && global.RouterIosXr && global.RouterIosXr.complete) {
+      return global.RouterIosXr.complete(line, router, state);
+    }
+    if (router.os === 'junos' && global.RouterJunos && global.RouterJunos.complete) {
+      return global.RouterJunos.complete(line, router, state);
+    }
+    // フォールバック
     const top = ['show', 'load-config', 'write', 'send', 'clear', 'exit', 'help', 'verify'];
     const token = line.trimStart().split(/\s+/)[0] || '';
     if (!line.includes(' ')) return top.filter(c => c.startsWith(token.toLowerCase()));

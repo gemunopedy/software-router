@@ -336,9 +336,8 @@
   _tabSaveEnabled = true;
 
   // BGP セッションを自動再起動（リロードで _bgpRetryTimers が消えるため）
-  const IosXe = window.RouterIosXe;
-  if (IosXe && IosXe.restoreBgpSessions) {
-    topology.nodes.forEach(node => IosXe.restoreBgpSessions(node));
+  if (window.RouterBgp) {
+    topology.nodes.forEach(node => RouterBgp.restoreSessions(node));
   }
 
   // ----- pcap (ブラウザ内ストア) -----
