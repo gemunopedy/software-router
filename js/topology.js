@@ -64,11 +64,8 @@
     // nodes
     topology.nodes.forEach(node => {
       const g = el('g', { class: 'topo-node', 'data-id': node.id });
-      const rectW = 100, rectH = 50;
-      g.appendChild(el('rect', {
-        x: node.x - rectW / 2, y: node.y - rectH / 2,
-        width: rectW, height: rectH, rx: 6, ry: 6,
-      }));
+      const r = 36;
+      g.appendChild(el('circle', { cx: node.x, cy: node.y, r }));
       const tId = el('text', { x: node.x, y: node.y - 4 });
       tId.textContent = node.id;
       g.appendChild(tId);

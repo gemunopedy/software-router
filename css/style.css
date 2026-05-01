@@ -134,23 +134,23 @@ body.edit-mode .topo-link { cursor: pointer; }
   pointer-events: none;
 }
 
-.topo-node rect {
+.topo-node circle {
   fill: #2d6cdf;
   stroke: #ffffff;
   stroke-width: 1.5;
-  cursor: grab;            /* 常にドラッグ可能 */
+  cursor: grab;
   transition: fill 0.15s;
 }
-.topo-node rect:active { cursor: grabbing; }
-body.tool-add-link .topo-node rect,
-body.tool-delete .topo-node rect { cursor: pointer; }
-.topo-node:hover rect { fill: #4a86ec; }
-.topo-node.selected rect {
+.topo-node circle:active { cursor: grabbing; }
+body.tool-add-link .topo-node circle,
+body.tool-delete .topo-node circle { cursor: pointer; }
+.topo-node:hover circle { fill: #4a86ec; }
+.topo-node.selected circle {
   fill: #e07b00;
   stroke: #ffd866;
   stroke-width: 2.5;
 }
-.topo-node.link-pending rect {
+.topo-node.link-pending circle {
   fill: #16a085;
   stroke: #ffd866;
 }
