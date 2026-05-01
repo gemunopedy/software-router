@@ -11,6 +11,14 @@
 
   // ---- ユーティリティ ----
 
+  // 省略コマンド展開: tok が cands の唯一前方一致なら展開、曖昧/不明なら原文維持
+  function _ex(tok, cands) {
+    const t = (tok || '').toLowerCase();
+    if (!t || cands.includes(t)) return t;
+    const m = cands.filter(c => c.startsWith(t));
+    return m.length === 1 ? m[0] : t;
+  }
+
   function _prefixToMask(bits) {
     const n = parseInt(bits, 10);
     if (n <= 0) return '0.0.0.0';
@@ -300,7 +308,7 @@
   };
 
   showHandlers['ip'] = (args, router, io) => {
-    const sub = (args[0] || '').toLowerCase();
+    const sub = _ex(args[0], ['interface','bgp','route']);
     if (sub === 'interface') {
       showHandlers['interfaces']([args[1] || 'brief'], router, io);
     } else if (sub === 'bgp') {
@@ -411,9 +419,19 @@
 
   // ---- メインコマンドハンドラ ----
 
+  // モード別動詞候補
+  const _ECANDS = ['configure','clear','commit','copy','disable','enable','exit','help','no','ping','send','show','write'];
+  const _CCANDS = ['do','end','exit','hostname','interface','ip','no','router'];
+  const _ICANDS = ['description','do','end','exit','ipv4','no','shutdown'];
+  const _BCANDS = ['bgp','do','end','exit','neighbor','network','no','router-id'];
+
   function handleCommand(parts, state, io) {
     const router = state.router;
-    const verb = (parts[0] || '').toLowerCase();
+    const _vcands = state.configMode === 'if' ? _ICANDS
+                  : state.configMode === 'router' ? _BCANDS
+                  : state.configMode ? _CCANDS
+                  : _ECANDS;
+    const verb = _ex(parts[0], _vcands);
 
     if (state.configMode) {
       if (verb === 'end') {
@@ -432,9 +450,10 @@
       // ---------- config-if ----------
       if (state.configMode === 'if') {
         const ifaceName = state.configIface;
+        const p1 = _ex(parts[1], ['address','description','ipv4','shutdown']);
 
         // ipv4 address <ip>/<prefix> | <ip> <mask>
-        if (verb === 'ipv4' && (parts[1] || '').toLowerCase() === 'address') {
+        if (verb === 'ipv4' && p1 === 'address') {
           const rawAddr = parts[2];
           if (!rawAddr) { io.println('% Incomplete command.'); return true; }
           const ip   = _normalizeIp(rawAddr);
@@ -447,7 +466,7 @@
         }
 
         // no ipv4 address
-        if (verb === 'no' && (parts[1]||'').toLowerCase() === 'ipv4') {
+        if (verb === 'no' && p1 === 'ipv4') {
           _removeIfaceLine(router, ifaceName, /^ipv4\s+address\s+/i);
           return true;
         }
@@ -457,7 +476,7 @@
           _updateIfaceLine(router, ifaceName, /^description\s*/i, `description ${parts.slice(1).join(' ')}`);
           return true;
         }
-        if (verb === 'no' && (parts[1]||'').toLowerCase() === 'description') {
+        if (verb === 'no' && p1 === 'description') {
           _removeIfaceLine(router, ifaceName, /^description\s*/i);
           return true;
         }
@@ -466,7 +485,7 @@
         if (verb === 'shutdown') {
           _updateIfaceLine(router, ifaceName, /^shutdown$/i, 'shutdown'); return true;
         }
-        if (verb === 'no' && (parts[1]||'').toLowerCase() === 'shutdown') {
+        if (verb === 'no' && p1 === 'shutdown') {
           _removeIfaceLine(router, ifaceName, /^shutdown$/i); return true;
         }
 
@@ -480,7 +499,7 @@
 
         // neighbor <ip> remote-as <as>
         if (verb === 'neighbor') {
-          const nIp = parts[1], key2 = (parts[2]||'').toLowerCase(), val = parts[3];
+          const nIp = parts[1], key2 = _ex(parts[2], ['remote-as','update-source','description','shutdown']), val = parts[3];
           if (!nIp) { io.println('% Incomplete command.'); return true; }
           if (key2 === 'remote-as') {
             if (!val) { io.println('% Incomplete command.'); return true; }
@@ -501,7 +520,7 @@
         }
 
         // no neighbor <ip>
-        if (verb === 'no' && (parts[1]||'').toLowerCase() === 'neighbor') {
+        if (verb === 'no' && _ex(parts[1], ['neighbor','network','bgp']) === 'neighbor') {
           const nIp = parts[2];
           if (!nIp) { io.println('% Incomplete command.'); return true; }
           _removeRouterLine(router, procKey, new RegExp(`^neighbor\\s+${nIp}\\s+`,'i'));
@@ -533,7 +552,7 @@
         }
 
         // no network <prefix>
-        if (verb === 'no' && (parts[1]||'').toLowerCase() === 'network') {
+        if (verb === 'no' && _ex(parts[1], ['neighbor','network','bgp']) === 'network') {
           const rawPrefix = parts[2];
           if (!rawPrefix) { io.println('% Incomplete command.'); return true; }
           const prefix = _normalizeIp(rawPrefix);
@@ -579,7 +598,7 @@
       }
 
       // no router bgp <asn>
-      if (verb === 'no' && (parts[1]||'').toLowerCase() === 'router' && (parts[2]||'').toLowerCase() === 'bgp') {
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname']) === 'router' && _ex(parts[2], ['bgp']) === 'bgp') {
         const asn = parts[3];
         if (!asn) { io.println('% Incomplete command.'); return true; }
         _removeRouterBlock(router, `bgp ${asn}`);
@@ -607,7 +626,7 @@
     // ============================================================
 
     if (verb === 'configure' || verb === 'conf') {
-      const sub = (parts[1] || 'terminal').toLowerCase();
+      const sub = _ex(parts[1] || 'terminal', ['terminal']);
       if (sub === 'terminal' || sub === 'term' || sub === 't') {
         io.println('Enter configuration commands, one per line.  End with CNTL/Z or "end".');
         state.configMode = 'global'; state.configIface = null;
@@ -626,7 +645,8 @@
     }
 
     if (verb === 'show' || verb === 'sh') {
-      const sub = (parts[1] || '').toLowerCase();
+      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','interfaces','ip','bgp','route','arp'];
+      const sub = _ex(parts[1], _SHOW_KEYS);
       if (!sub) { io.println('% Incomplete command.'); return true; }
       const handler = showHandlers[sub];
       if (handler) { handler(parts.slice(2), router, io); return true; }

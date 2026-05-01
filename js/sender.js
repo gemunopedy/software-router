@@ -196,5 +196,5 @@
     return _resolveArp(router, srcIp, dstIp, srcMacBytes, iface, io);
   }
 
-  global.RouterSender = { getArpEntries, clearArpEntries, resolveArp };
+  global.RouterSender = { getArpEntries, clearArpEntries, resolveArp, findOwner };
 })(window);

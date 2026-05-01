@@ -20,6 +20,14 @@
 
   // ---- ユーティリティ ----
 
+  // 省略コマンド展開: tok が cands の唯一前方一致なら展開、曖昧/不明なら原文維持
+  function _ex(tok, cands) {
+    const t = (tok || '').toLowerCase();
+    if (!t || cands.includes(t)) return t;
+    const m = cands.filter(c => c.startsWith(t));
+    return m.length === 1 ? m[0] : t;
+  }
+
   function _prefixToMask(bits) {
     const n = parseInt(bits, 10);
     if (n <= 0) return '0.0.0.0';
@@ -461,9 +469,14 @@
 
   // ---- メインコマンドハンドラ ----
 
+  // モード別動詞候補
+  const _ECANDS_J = ['commit','edit','exit','ping','request','set','show','write'];
+  const _ECFG_J   = ['commit','delete','exit','quit','rename','rollback','set','show','top'];
+
   function handleCommand(parts, state, io) {
     const router = state.router;
-    const verb = (parts[0] || '').toLowerCase();
+    const _vcands = state.configMode === 'edit' ? _ECFG_J : _ECANDS_J;
+    const verb = _ex(parts[0], _vcands);
 
     // ---- 設定モード（edit 後）----
     if (state.configMode === 'edit') {
@@ -475,7 +488,8 @@
       if (verb === 'top') { return true; } // already at top
 
       if (verb === 'show') {
-        const sub = (parts[1] || '').toLowerCase();
+        const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp'];
+        const sub = _ex(parts[1], _SHOW_J);
         if (!sub || sub === '|' || sub === 'all') { showConfig(router, io); return true; }
         // show interfaces etc. from config mode
       }
@@ -527,7 +541,8 @@
     }
 
     if (verb === 'show') {
-      const sub = (parts[1] || '').toLowerCase();
+      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp'];
+      const sub = _ex(parts[1], _SHOW_J);
       if (sub === 'interfaces' || sub === 'interface') {
         showInterfaces(parts.slice(2), router, io); return true;
       }

@@ -12,6 +12,14 @@
 
   // --------- パーサユーティリティ ---------
 
+  // 省略コマンド展開: tok が cands の唯一前方一致なら展開、曖昧/不明なら原文維持
+  function _ex(tok, cands) {
+    const t = (tok || '').toLowerCase();
+    if (!t || cands.includes(t)) return t;
+    const m = cands.filter(c => c.startsWith(t));
+    return m.length === 1 ? m[0] : t;
+  }
+
   function readCfg(router) {
     return Storage.read(router.id, 'running') || Storage.read(router.id, 'startup') || '';
   }
@@ -200,7 +208,7 @@
 
   // show ip interface brief
   showHandlers['ip'] = (args, router, io) => {
-    const sub = args[0] ? args[0].toLowerCase() : '';
+    const sub = _ex(args[0], ['interface','route','bgp']);
     const cfg = readCfg(router);
 
     if (sub === 'interface' && (args[1] || '').match(/^br/i)) {
@@ -711,9 +719,19 @@
 
   // ------- メインディスパッチャ -------
   // parts[0] = 動詞（'show' / 'write' / ...）
+  // モード別動詞候補（prefix 展開用）
+  const _ECANDS = ['configure','clear','copy','disable','enable','exit','help','load-config','no','ping','send','show','write'];
+  const _CCANDS = ['do','end','exit','hostname','interface','ip','no','router'];
+  const _ICANDS = ['description','do','end','exit','ip','no','shutdown'];
+  const _BCANDS = ['bgp','do','end','exit','neighbor','network','no','router-id'];
+
   function handleCommand(parts, state, io) {
     const router = state.router;
-    const verb = (parts[0] || '').toLowerCase();
+    const _vcands = state.configMode === 'if' ? _ICANDS
+                  : state.configMode === 'router' ? _BCANDS
+                  : state.configMode ? _CCANDS
+                  : _ECANDS;
+    const verb = _ex(parts[0], _vcands);
 
     // ============================================================
     // configure モード内ハンドラ
@@ -742,9 +760,11 @@
       // ---------- config-if モード ----------
       if (state.configMode === 'if') {
         const ifaceName = state.configIface;
+        const p1 = _ex(parts[1], ['address','description','ip','shutdown']);
+        const p2 = _ex(parts[2], ['address']);
 
         // ip address <addr> <mask>
-        if (verb === 'ip' && (parts[1] || '').toLowerCase() === 'address') {
+        if (verb === 'ip' && p1 === 'address') {
           const addr = parts[2], mask = parts[3];
           if (!addr || !mask) { io.println('% Incomplete command.'); return true; }
           if (!/^\d+\.\d+\.\d+\.\d+$/.test(addr) || !/^\d+\.\d+\.\d+\.\d+$/.test(mask)) {
@@ -757,7 +777,7 @@
         }
 
         // no ip address
-        if (verb === 'no' && (parts[1] || '').toLowerCase() === 'ip' && (parts[2] || '').toLowerCase() === 'address') {
+        if (verb === 'no' && p1 === 'ip' && p2 === 'address') {
           _removeIfaceLine(router, ifaceName, /^ip address\s+/i);
           return true;
         }
@@ -770,7 +790,7 @@
         }
 
         // no description
-        if (verb === 'no' && (parts[1] || '').toLowerCase() === 'description') {
+        if (verb === 'no' && p1 === 'description') {
           _removeIfaceLine(router, ifaceName, /^description\s*/i);
           return true;
         }
@@ -780,7 +800,7 @@
           _updateIfaceLine(router, ifaceName, /^shutdown$/i, 'shutdown');
           return true;
         }
-        if (verb === 'no' && (parts[1] || '').toLowerCase() === 'shutdown') {
+        if (verb === 'no' && p1 === 'shutdown') {
           _removeIfaceLine(router, ifaceName, /^shutdown$/i);
           return true;
         }
@@ -795,7 +815,7 @@
 
         // neighbor <ip> remote-as <as>
         if (verb === 'neighbor') {
-          const nIp = parts[1], key2 = (parts[2] || '').toLowerCase(), val = parts[3];
+          const nIp = parts[1], key2 = _ex(parts[2], ['remote-as','update-source','description','shutdown']), val = parts[3];
           if (!nIp) { io.println('% Incomplete command.'); return true; }
           if (key2 === 'remote-as') {
             if (!val) { io.println('% Incomplete command.'); return true; }
@@ -818,8 +838,8 @@
         }
 
         // no neighbor <ip> ...
-        if (verb === 'no' && (parts[1] || '').toLowerCase() === 'neighbor') {
-          const nIp = parts[2], key2 = (parts[3] || '').toLowerCase();
+        if (verb === 'no' && _ex(parts[1], ['neighbor','network','bgp']) === 'neighbor') {
+          const nIp = parts[2], key2 = _ex(parts[3], ['remote-as','update-source','description','shutdown']);
           if (!nIp) { io.println('% Incomplete command.'); return true; }
           if (!key2 || key2 === 'remote-as') {
             // remote-as なしで no neighbor → ネイバー全行削除＋セッション切断
@@ -854,7 +874,7 @@
         }
 
         // no network <prefix>
-        if (verb === 'no' && (parts[1] || '').toLowerCase() === 'network') {
+        if (verb === 'no' && _ex(parts[1], ['neighbor','network','bgp']) === 'network') {
           const prefix = parts[2];
           if (!prefix) { io.println('% Incomplete command.'); return true; }
           // 削除前にマスクを取得してから config から除去
@@ -911,7 +931,7 @@
       }
 
       // no router bgp <as-number>
-      if (verb === 'no' && (parts[1] || '').toLowerCase() === 'router' && (parts[2] || '').toLowerCase() === 'bgp') {
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'router' && _ex(parts[2], ['bgp']) === 'bgp') {
         const asn = parts[3];
         if (!asn) { io.println('% Incomplete command.'); return true; }
         _removeRouterBlock(router, `bgp ${asn}`);
@@ -931,7 +951,7 @@
       }
 
       // no interface <name>
-      if (verb === 'no' && (parts[1] || '').toLowerCase() === 'interface') {
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'interface') {
         const name = parts[2];
         if (!name) { io.println('% Incomplete command.'); return true; }
         _removeIface(router, name);
@@ -948,7 +968,7 @@
 
     // --- configure terminal ---
     if (verb === 'configure' || verb === 'conf') {
-      const sub = (parts[1] || 'terminal').toLowerCase();
+      const sub = _ex(parts[1] || 'terminal', ['terminal']);
       if (sub === 'terminal' || sub === 'term' || sub === 't') {
         io.println('Enter configuration commands, one per line.  End with CNTL/Z or "end".');
         state.configMode = 'global';
@@ -965,7 +985,8 @@
 
     // --- show ---
     if (verb === 'show' || verb === 'sh') {
-      const sub = (parts[1] || '').toLowerCase();
+      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','ip','arp','interfaces','ospf','clock','history'];
+      const sub = _ex(parts[1], _SHOW_KEYS);
       if (!sub) {
         io.println('% Incomplete command. Type "show ?" for help.');
         return true;

@@ -434,6 +434,9 @@
           const srcMac = Packets.buildIfaceMac(rIdx, ifaceIdx);
           const finalDst = dstMac || BCAST;
 
+          // 宛先ルータの情報を取得（ICMP を双方向に記録するため）
+          const dstOwner = Sender ? Sender.findOwner(dst) : null;
+
           // Echo Request
           const reqPkt = Packets.buildPacket({
             proto: 'icmp', src: srcIp, dst, srcMac, dstMac: finalDst,
@@ -441,6 +444,11 @@
           });
           Pcap.append(router.id, reqPkt);
           Capture.emit(router.id, reqPkt, { iface: srcIface });
+          // 宛先ルータにも Request を記録
+          if (dstOwner) {
+            Pcap.append(dstOwner.routerId, reqPkt);
+            Capture.emit(dstOwner.routerId, reqPkt, { iface: dstOwner.ifaceName });
+          }
 
           if (success) {
             // Echo Reply (相手ルータから返る)
@@ -460,6 +468,11 @@
             const csum = (~sum) & 0xffff;
             replyPkt[36] = (csum >> 8) & 0xff; replyPkt[37] = csum & 0xff;
 
+            // 宛先ルータにも Reply を記録（送信元として）
+            if (dstOwner) {
+              Pcap.append(dstOwner.routerId, replyPkt);
+              Capture.emit(dstOwner.routerId, replyPkt, { iface: dstOwner.ifaceName });
+            }
             Pcap.append(router.id, replyPkt);
             Capture.emit(router.id, replyPkt, { iface: srcIface });
 
@@ -471,6 +484,7 @@
       }
 
       // 統計表示（dots 行を改行で締める）
+      if (global.AppRefreshPcapStatus) global.AppRefreshPcapStatus();
       if (router.os === 'junos') {
         io.println(`--- ${dst} ping statistics ---`);
         io.println(`${repeat} packets transmitted, ${successes} packets received, ${Math.round((repeat-successes)*100/repeat)}% packet loss`);
