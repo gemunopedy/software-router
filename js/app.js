@@ -418,17 +418,26 @@
     s.term.focus();
   });
   btnReset.addEventListener('click', () => {
-    if (!confirm('トポロジーと全ルータの設定を初期状態に戻します。よろしいですか？')) return;
-    // 既存タブを閉じる
+    if (!confirm('トポロジーと全設定・キャプチャを削除します。よろしいですか？')) return;
+
+    // キャプチャ停止・タブクローズ
+    stopCaptureAll();
+    [...openCapTabs.keys()].forEach(paneId => { if (tm.has(paneId)) tm.closeRouter(paneId); });
+    openCapTabs.clear();
+    try { localStorage.removeItem(CAP_TABS_KEY); } catch (_) {}
+    if (window.RouterPcap) RouterPcap.clear();
+
+    // ルータタブを閉じる
     [...topology.nodes].forEach(n => { if (tm.has(n.id)) tm.closeRouter(n.id); });
+
+    // BGP・設定・トポロジーをクリア
     if (window.RouterBgp) RouterBgp.clearAll();
     Storage.resetAll(editor.getTopology());
     Storage.clearTopology();
-    topology = Storage.loadTopology(DEFAULT_TOPO);
-    Storage.ensureDefaults(topology);
+
+    // 空トポロジーに
+    topology = { nodes: [], links: [] };
     editor.setTopology(topology);
-    openAllTabs();
-    if (topology.nodes.length > 0) tm.activate(topology.nodes[0].id);
     updateBadge();
   });
 })();
