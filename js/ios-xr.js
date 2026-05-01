@@ -198,7 +198,7 @@
   // ---- GARP ----
 
   function _sendGarp(router, ifaceName, addr) {
-    if (!Packets || !global.RouterCapture) return;
+    if (!Packets) return;
     const cfg = Storage.read(router.id, 'running') || '';
     let ifaceIdx = 0, counter = 0;
     for (const line of cfg.split('\n')) {
@@ -209,7 +209,9 @@
     }
     const mac = Packets.buildIfaceMac(topoIdx(router.id), ifaceIdx);
     const pkt = Packets.buildPacket({ proto: 'arp', op: 1, src: addr, dst: addr, srcMac: mac });
-    global.RouterCapture.emit(router.id, pkt, { iface: ifaceName });
+    const Pcap = global.RouterPcap;
+    if (Pcap) { Pcap.append(router.id, pkt); if (global.AppRefreshPcapStatus) global.AppRefreshPcapStatus(); }
+    if (global.RouterCapture) global.RouterCapture.emit(router.id, pkt, { iface: ifaceName });
   }
 
   // ---- show コマンド ----

@@ -93,7 +93,7 @@
   // GARP (Gratuitous ARP Request) を capture に emit する
   // op=1 (request): sender IP = target IP = addr, target MAC = 00:00:00:00:00:00, dst eth = broadcast
   function _sendGarp(router, ifaceName, addr) {
-    if (!Packets || !Capture) return;
+    if (!Packets) return;
     const cfg = readCfg(router);
     // interface の宣言順から 0-based ifaceIdx を求める
     let ifaceIdx = 0, counter = 0;
@@ -109,7 +109,9 @@
       src: addr, dst: addr,
       srcMac: mac,
     });
-    Capture.emit(router.id, pkt, { iface: ifaceName });
+    const Pcap = global.RouterPcap;
+    if (Pcap) { Pcap.append(router.id, pkt); if (global.AppRefreshPcapStatus) global.AppRefreshPcapStatus(); }
+    if (Capture) Capture.emit(router.id, pkt, { iface: ifaceName });
   }
 
   // IF 単位の MAC を Cisco ドット表記で返す (例: 5000.0001.0000)

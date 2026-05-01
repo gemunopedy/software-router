@@ -131,14 +131,16 @@
 
   // GARP 送信
   function _sendGarp(router, ifaceName, addr) {
-    if (!Packets || !global.RouterCapture) return;
+    if (!Packets) return;
     const cfg = Storage.read(router.id, 'running') || '';
     const ifaces = getInterfaces(cfg);
     const idx = ifaces.findIndex(f => f.name === ifaceName);
     const ifaceIdx = idx >= 0 ? idx : 0;
     const mac = Packets.buildIfaceMac(topoIdx(router.id), ifaceIdx);
     const pkt = Packets.buildPacket({ proto: 'arp', op: 1, src: addr, dst: addr, srcMac: mac });
-    global.RouterCapture.emit(router.id, pkt, { iface: ifaceName });
+    const Pcap = global.RouterPcap;
+    if (Pcap) { Pcap.append(router.id, pkt); if (global.AppRefreshPcapStatus) global.AppRefreshPcapStatus(); }
+    if (global.RouterCapture) global.RouterCapture.emit(router.id, pkt, { iface: ifaceName });
   }
 
   // ---- show コマンド ----
