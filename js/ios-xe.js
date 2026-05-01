@@ -1546,6 +1546,16 @@
       if (v === 'neighbor' && before.length === 2)
         return ['remote-as', 'description', 'update-source', 'shutdown']
           .filter(s => s.startsWith(last.toLowerCase()));
+      if (v === 'network' && before.length === 2)
+        return ['mask'].filter(s => s.startsWith(last.toLowerCase()));
+      if (v === 'network' && before[2] === 'mask' && before.length === 3) {
+        const masks = [
+          '255.0.0.0', '255.128.0.0', '255.255.0.0', '255.255.128.0',
+          '255.255.255.0', '255.255.255.128', '255.255.255.192',
+          '255.255.255.224', '255.255.255.240', '255.255.255.248', '255.255.255.252',
+        ];
+        return masks.filter(m => m.startsWith(last));
+      }
       if (v === 'no' && before.length === 1)
         return ['neighbor', 'network'].filter(s => s.startsWith(last.toLowerCase()));
       return [];
