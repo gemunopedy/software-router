@@ -262,6 +262,60 @@
     Storage.write(router.id, 'running', out.join('\n'));
   }
 
+  // router static / address-family ipv6 unicast への行追加/置換
+  function _updateIpv6StaticLine(router, prefix, prefixLen, nexthop, ad) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const entry = ad !== 1 ? `${prefix}/${prefixLen} ${nexthop} ${ad}` : `${prefix}/${prefixLen} ${nexthop}`;
+    const matchRe = new RegExp(`^${prefix.replace(/:/g,'\\:')}\\/${prefixLen}\\s+`);
+    if (!/^router\s+static\s*$/im.test(cfg)) {
+      Storage.write(router.id, 'running', cfg.trimEnd() + `\nrouter static\n  address-family ipv6 unicast\n   ${entry}\n`);
+      return;
+    }
+    // Already have router static block — insert into ipv6 AF section or append
+    const lines = cfg.split('\n');
+    let inStatic = false, inIpv6Af = false, inserted = false;
+    const out = [];
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (/^router\s+static\s*$/i.test(t)) { inStatic = true; out.push(t); continue; }
+      if (inStatic) {
+        if (t !== '' && !/^[ \t]/.test(t)) {
+          if (!inserted) {
+            out.push('  address-family ipv6 unicast');
+            out.push(`   ${entry}`);
+            inserted = true;
+          }
+          inStatic = false;
+        } else if (/address-family\s+ipv6/i.test(t.trim())) {
+          inIpv6Af = true; out.push(t); continue;
+        } else if (/address-family/i.test(t.trim())) {
+          inIpv6Af = false; out.push(t); continue;
+        } else if (inIpv6Af && matchRe.test(t.trim())) {
+          out.push(`   ${entry}`); inserted = true; continue;
+        }
+      }
+      out.push(t);
+    }
+    if (!inserted) out.push(`   ${entry}`);
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  function _removeIpv6StaticLine(router, prefix, prefixLen) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const matchRe = new RegExp(`^${prefix.replace(/:/g,'\\:')}\\/${prefixLen}\\s+`);
+    let inStatic = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (/^router\s+static\s*$/i.test(t)) { inStatic = true; return true; }
+      if (inStatic) {
+        if (t !== '' && !/^[ \t]/.test(t)) { inStatic = false; return true; }
+        if (matchRe.test(t.trim())) return false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
   function topoIdx(routerId) {
     const topo = global.TOPOLOGY;
     if (!topo || !topo.nodes) return 1;
@@ -1110,12 +1164,64 @@
     io.println(`% Invalid input after 'show segment-routing mpls'`);
   };
 
+  // show ipv6 interface / route / neighbors
+  showHandlers['ipv6'] = (args, router, io) => {
+    if (!window.RouterIpv6) { io.println('% IPv6 not initialized'); return; }
+    const Ipv6 = window.RouterIpv6;
+    const sub = _ex(args[0], ['interface','route','neighbors','neighbor']);
+    if (sub === 'interface') {
+      const brief = (args[1] || '').toLowerCase().startsWith('br');
+      const ifaces = Ipv6.getInterfaceAddrs(router.id);
+      if (brief) {
+        for (const f of ifaces) {
+          const ll = f.ipv6.find(a => a.type === 'link-local');
+          io.println(f.name.padEnd(25) + '[up/up]  ' + (ll ? ll.addr.toUpperCase() : 'unassigned'));
+        }
+        return;
+      }
+      for (const f of ifaces) {
+        const ll = f.ipv6.find(a => a.type === 'link-local');
+        const globals = f.ipv6.filter(a => a.type !== 'link-local');
+        io.println(`${f.name} is up, line protocol is up`);
+        io.println('  IPv6 is enabled, link-local address is ' + (ll ? ll.addr.toUpperCase() : 'none'));
+        globals.forEach(({ addr, prefixLen }) => {
+          const netBig = Ipv6.networkIpv6(addr, prefixLen);
+          io.println(`  Global unicast: ${addr.toUpperCase()}/${prefixLen}, subnet ${Ipv6.formatIpv6(netBig).toUpperCase()}/${prefixLen}`);
+        });
+      }
+      return;
+    }
+    if (sub === 'route') {
+      const staticOnly = (args[1] || '').toLowerCase().startsWith('st');
+      const routes = Ipv6.getIpv6Routes(router.id);
+      const filtered = staticOnly ? routes.filter(r => r.type === 'S') : routes;
+      io.println(`IPv6 Routing Table (${filtered.length} entries)`);
+      filtered.forEach(r => {
+        if (r.type === 'C') io.println(`C   ${r.prefix.toUpperCase()}/${r.prefixLen} via ${r.iface}, directly connected`);
+        else if (r.type === 'L') io.println(`L   ${r.prefix.toUpperCase()}/${r.prefixLen} via ${r.iface}, receive`);
+        else if (r.type === 'S') io.println(`S   ${r.prefix.toUpperCase()}/${r.prefixLen} [${r.ad}/0] via ${r.nexthop.toUpperCase()}`);
+      });
+      if (filtered.length === 0) io.println('  (no IPv6 routes)');
+      return;
+    }
+    if (sub === 'neighbors' || sub === 'neighbor') {
+      const neighbors = Ipv6.getNdpNeighbors(router.id);
+      io.println('IPv6 Address                            Age  Link-layer Addr  State  Interface');
+      neighbors.forEach(n => {
+        io.println(n.addr.toUpperCase().padEnd(40) + '0    ' + n.mac.padEnd(17) + n.state.padEnd(7) + n.iface);
+      });
+      if (neighbors.length === 0) io.println('  (no NDP neighbors)');
+      return;
+    }
+    io.println(`% Invalid input after 'show ipv6'`);
+  };
+
   // ---- メインコマンドハンドラ ----
 
   // モード別動詞候補
   const _ECANDS = ['configure','clear','commit','copy','disable','enable','exit','help','no','ping','send','show','write'];
   const _CCANDS = ['do','end','exit','hostname','interface','ip','no','router','vrf'];
-  const _ICANDS = ['description','do','end','exit','ipv4','mpls','no','shutdown','vrf'];
+  const _ICANDS = ['description','do','end','exit','ipv4','ipv6','mpls','no','shutdown','vrf'];
   const _BCANDS = ['bgp','do','end','exit','neighbor','network','no','router-id'];
   const _VDEFCANDS_XR = ['address-family', 'exit-address-family', 'rd', 'import', 'export', 'no', 'exit', 'end'];
   const _SCANDS = ['address-family','do','end','exit','no'];
@@ -1159,6 +1265,8 @@
           state.configMode = 'global'; state.configOspfProcess = null;
         } else if (state.configMode === 'vrf') {
           state.configMode = 'global'; state.configVrf = null;
+        } else if (state.configMode === 'static' && state.configStaticAf) {
+          state.configStaticAf = null;
         } else if (state.configMode === 'if' || state.configMode === 'router' || state.configMode === 'static' || state.configMode === 'isis') {
           state.configMode = 'global'; state.configIface = null; state.configRouter = null;
           state.configIsisProcess = null; state.configIsisIface = null;
@@ -1170,22 +1278,38 @@
 
       // ---------- config-static モード ----------
       if (state.configMode === 'static') {
-        // address-family ipv4 unicast はパススルー（モード変更なし）
-        if (verb === 'address-family') return true;
-        // no <prefix/len> [<nexthop>] → 削除
+        // address-family ipv4/ipv6 unicast → set active AF
+        if (verb === 'address-family') {
+          const af = (parts[1] || '').toLowerCase();
+          state.configStaticAf = af.startsWith('ipv6') ? 'ipv6' : 'ipv4';
+          return true;
+        }
+        // exit from within an AF goes back to static root; exit from static goes to global
+        // (exit is handled by the outer exit handler — override it here)
+        // no <prefix/len> → delete
         if (verb === 'no') {
           const cidr = parts[1];
           if (!cidr || !cidr.includes('/')) { io.println('% Incomplete: <prefix/len> required'); return true; }
           const [prefix, lenStr] = cidr.split('/');
-          _removeStaticLine(router, prefix, parseInt(lenStr, 10));
+          if (state.configStaticAf === 'ipv6') {
+            _removeIpv6StaticLine(router, prefix, parseInt(lenStr, 10));
+          } else {
+            _removeStaticLine(router, prefix, parseInt(lenStr, 10));
+          }
           return true;
         }
         // <prefix/len> <nexthop> [<ad>]
         const cidr = parts[0], nexthop = parts[1];
-        if (cidr && cidr.includes('/') && nexthop && /^\d+\.\d+\.\d+\.\d+$/.test(nexthop)) {
+        if (cidr && cidr.includes('/') && nexthop) {
           const [prefix, lenStr] = cidr.split('/');
           const ad = parts[2] && /^\d+$/.test(parts[2]) ? parseInt(parts[2]) : 1;
-          _updateStaticLine(router, prefix, parseInt(lenStr, 10), nexthop, ad);
+          if (state.configStaticAf === 'ipv6') {
+            _updateIpv6StaticLine(router, prefix, parseInt(lenStr, 10), nexthop, ad);
+          } else if (/^\d+\.\d+\.\d+\.\d+$/.test(nexthop)) {
+            _updateStaticLine(router, prefix, parseInt(lenStr, 10), nexthop, ad);
+          } else {
+            io.println(`% Invalid nexthop: ${nexthop}`);
+          }
           return true;
         }
         io.println(`% Invalid input in config-static: ${parts.join(' ')}`);
@@ -1275,6 +1399,20 @@
         if (verb === 'no' && _ex(parts[1], ['prefix-sid']) === 'prefix-sid') {
           _removeIfaceLine(router, ifaceName, /^prefix-sid\s+/i);
           if (window.RouterSr) window.RouterSr.recalculate();
+          return true;
+        }
+
+        // ipv6 address <addr>/<prefixLen>
+        if (verb === 'ipv6' && (parts[1] || '').toLowerCase() === 'address') {
+          const raw = parts[2];
+          if (!raw || !raw.includes('/')) { io.println('% Incomplete command.'); return true; }
+          const [addr, lenStr] = raw.split('/');
+          _updateIfaceLine(router, ifaceName, /^ipv6\s+address\s+/i, `ipv6 address ${addr}/${lenStr}`);
+          return true;
+        }
+        // no ipv6 address
+        if (verb === 'no' && _ex(parts[1], ['ipv4','ipv6','description','shutdown','vrf','mpls','prefix-sid']) === 'ipv6') {
+          _removeIfaceLine(router, ifaceName, /^ipv6\s+address\s+/i);
           return true;
         }
 
@@ -1797,7 +1935,7 @@
     }
 
     if (verb === 'show' || verb === 'sh') {
-      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','interfaces','ip','bgp','route','arp','isis','ospf','vrf','mpls','segment-routing'];
+      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','interfaces','ip','ipv6','bgp','route','arp','isis','ospf','vrf','mpls','segment-routing'];
       const sub = _ex(parts[1], _SHOW_KEYS);
       if (!sub) { io.println('% Incomplete command.'); return true; }
       const handler = showHandlers[sub];
@@ -1813,6 +1951,22 @@
 
     if (verb === 'copy') {
       io.println("% 'copy' is not supported on IOS-XR. Use 'commit'.");
+      return true;
+    }
+
+    // --- ping ipv6 ---
+    if (verb === 'ping' && (parts[1] || '').toLowerCase() === 'ipv6') {
+      const addr = parts[2];
+      if (!addr) { io.println('% Usage: ping ipv6 <addr>'); return true; }
+      if (!window.RouterIpv6) { io.println('% IPv6 not initialized'); return true; }
+      const neighbors = window.RouterIpv6.getNdpNeighbors(router.id);
+      const target = window.RouterIpv6.canonIpv6(addr);
+      const reachable = neighbors.some(n => n.addr === target);
+      io.println('Type escape sequence to abort.');
+      io.println(`Sending 5, 100-byte ICMP Echos to ${addr}`);
+      io.println(reachable ? '!!!!!' : '.....');
+      io.println('');
+      io.println(`Success rate is ${reachable ? 100 : 0} percent (${reachable ? '5/5' : '0/5'})`);
       return true;
     }
 
@@ -2070,4 +2224,41 @@
   }
 
   global.RouterIosXr = { handleCommand, complete, restoreBgpSessions };
+
+  // IPv6 パーサ登録
+  if (window.RouterIpv6) {
+    window.RouterIpv6.registerOsParser('ios-xr', {
+      getInterfaceAddrs(cfg) {
+        return parseInterfaces(cfg).map(blk => {
+          const ipv4Info = getIfIpInfo(blk);
+          const ipv4 = ipv4Info ? [{ ip: ipv4Info.ip, prefixLen: _maskToPrefix(ipv4Info.mask) }] : [];
+          const ipv6 = [];
+          for (const l of blk.lines) {
+            const m6 = l.match(/^ipv6\s+address\s+([\w:]+)\/([\d]+)/i);
+            if (m6) ipv6.push({ addr: m6[1], prefixLen: parseInt(m6[2], 10), type: 'global' });
+          }
+          return { name: blk.name, ipv4, ipv6, shutdown: false };
+        });
+      },
+      getIpv6StaticRoutes(cfg) {
+        const result = [];
+        const lines = (cfg || '').split('\n');
+        let inStatic = false, inIpv6Af = false;
+        for (const raw of lines) {
+          const t = raw.trimEnd();
+          if (/^router\s+static\s*$/i.test(t)) { inStatic = true; continue; }
+          if (inStatic) {
+            if (t !== '' && !/^[ \t]/.test(t)) { inStatic = false; inIpv6Af = false; continue; }
+            if (/address-family\s+ipv6/i.test(t.trim())) { inIpv6Af = true; continue; }
+            if (/address-family/i.test(t.trim())) { inIpv6Af = false; continue; }
+            if (inIpv6Af) {
+              const m = t.trim().match(/^([\w:]+)\/([\d]+)\s+([\w:]+)(?:\s+(\d+))?$/);
+              if (m) result.push({ prefix: m[1], prefixLen: parseInt(m[2], 10), nexthop: m[3], ad: m[4] ? parseInt(m[4], 10) : 1 });
+            }
+          }
+        }
+        return result;
+      },
+    });
+  }
 })(window);

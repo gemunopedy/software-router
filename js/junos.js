@@ -550,6 +550,14 @@
         _sendGarp(router, ifname, ip);
         return true;
       }
+      // family inet6 address <addr>/<len>
+      const addr6M = restStr.match(/unit\s+(\d+)\s+family\s+inet6\s+address\s+([\w:]+\/[\d]+)/i);
+      if (addr6M) {
+        const unit = addr6M[1];
+        _deleteLines(router, new RegExp(`^set interfaces ${ifname.replace(/\//g,'\\/')} unit ${unit} family inet6 address `, 'i'));
+        _setLine(router, `set interfaces ${ifname} ${restStr}`);
+        return true;
+      }
       // その他: そのまま保存
       _setLine(router, `set interfaces ${ifname} ${restStr}`);
       return true;
@@ -576,9 +584,26 @@
         const nexthop = rest[nhIdx + 1];
         const prefIdx = rest.findIndex(w => w.toLowerCase() === 'preference');
         const ad = prefIdx >= 0 && rest[prefIdx + 1] ? ` preference ${rest[prefIdx + 1]}` : '';
-        _deleteLines(router, new RegExp(`^set routing-options static route ${cidr.replace(/\./g,'\\.').replace('/','\/')} next-hop\\s+`, 'i'));
+        const cidrEsc = cidr.replace(/\./g,'\\.').replace(/:/g,'\\:').replace('/','\/');
+        _deleteLines(router, new RegExp(`^set routing-options static route ${cidrEsc} next-hop\\s+`, 'i'));
         _setLine(router, `set routing-options static route ${cidr} next-hop ${nexthop}${ad}`);
         return true;
+      }
+      // set routing-options rib inet6.0 static route <prefix> next-hop <nexthop>
+      if (key === 'rib' && (rest[1] || '').toLowerCase() === 'inet6.0') {
+        if ((rest[2] || '').toLowerCase() === 'static' && (rest[3] || '').toLowerCase() === 'route') {
+          const cidr6 = rest[4];
+          if (!cidr6 || !cidr6.includes('/')) { io.println('% Usage: set routing-options rib inet6.0 static route <prefix/len> next-hop <nexthop>'); return true; }
+          const nhIdx = rest.findIndex(w => w.toLowerCase() === 'next-hop');
+          if (nhIdx < 0 || !rest[nhIdx + 1]) { io.println('% next-hop required'); return true; }
+          const nexthop6 = rest[nhIdx + 1];
+          const prefIdx = rest.findIndex(w => w.toLowerCase() === 'preference');
+          const ad6 = prefIdx >= 0 && rest[prefIdx + 1] ? ` preference ${rest[prefIdx + 1]}` : '';
+          const cidr6Esc = cidr6.replace(/:/g,'\\:').replace('/','\/');
+          _deleteLines(router, new RegExp(`^set routing-options rib inet6\\.0 static route ${cidr6Esc} next-hop\\s+`, 'i'));
+          _setLine(router, `set routing-options rib inet6.0 static route ${cidr6} next-hop ${nexthop6}${ad6}`);
+          return true;
+        }
       }
     }
 
@@ -887,6 +912,12 @@
         _deleteLines(router, new RegExp(`^set routing-options static route ${cidr.replace(/\./g,'\\.').replace('/','\/')}\\s+`, 'i'));
         return true;
       }
+      if (key === 'rib' && (rest[1] || '').toLowerCase() === 'inet6.0' && (rest[2] || '').toLowerCase() === 'static' && (rest[3] || '').toLowerCase() === 'route' && rest[4]) {
+        const cidr6 = rest[4];
+        const cidr6Esc = cidr6.replace(/:/g,'\\:').replace('/','\/');
+        _deleteLines(router, new RegExp(`^set routing-options rib inet6\\.0 static route ${cidr6Esc}\\s+`, 'i'));
+        return true;
+      }
     }
 
     if (cat === 'routing-instances') {
@@ -990,8 +1021,49 @@
     }
 
     if (verb === 'show') {
-      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances','ldp','spring-te'];
+      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances','ldp','spring-te','ipv6'];
       const sub = _ex(parts[1], _SHOW_J);
+      if (sub === 'ipv6') {
+        if (!window.RouterIpv6) { io.println('% IPv6 not initialized'); return true; }
+        const Ipv6 = window.RouterIpv6;
+        const sub2 = (parts[2] || '').toLowerCase();
+        if (sub2 === 'neighbor' || sub2 === 'neighbors') {
+          const neighbors = Ipv6.getNdpNeighbors(router.id);
+          io.println('IPv6 Neighbor Cache:');
+          io.println('IPv6 Address                            State Expires    Interface');
+          neighbors.forEach(n => {
+            io.println(n.addr.toUpperCase().padEnd(40) + n.state.padEnd(6) + ' -         ' + n.iface);
+          });
+          if (neighbors.length === 0) io.println(' (no NDP neighbors)');
+          return true;
+        }
+        io.println(`% Unknown: show ipv6 ${parts[2] || ''}`); return true;
+      }
+      // show route table inet6.0
+      if (sub === 'route') {
+        if ((parts[2] || '').toLowerCase() === 'table' && (parts[3] || '').toLowerCase() === 'inet6.0') {
+          if (!window.RouterIpv6) { io.println('% IPv6 not initialized'); return true; }
+          const routes = window.RouterIpv6.getIpv6Routes(router.id);
+          io.println(`inet6.0: ${routes.length} destinations, ${routes.length} routes (${routes.length} active, 0 holddown, 0 hidden)`);
+          io.println('');
+          io.println('+ = Active Route, - = Last Active, * = Both');
+          io.println('');
+          routes.forEach(r => {
+            if (r.type === 'C') {
+              io.println(`${r.prefix.toUpperCase()}/${r.prefixLen}     *[Direct/0] preference 0`);
+              io.println(`                    > via ${r.iface}`);
+            } else if (r.type === 'L') {
+              io.println(`${r.prefix.toUpperCase()}/${r.prefixLen}       *[Local/0] preference 0`);
+              io.println(`                      Local via ${r.iface}`);
+            } else if (r.type === 'S') {
+              io.println(`${r.prefix.toUpperCase()}/${r.prefixLen}   *[Static/${r.ad}] preference ${r.ad}`);
+              io.println(`                    > to ${r.nexthop.toUpperCase()}`);
+            }
+          });
+          if (routes.length === 0) io.println('  (no IPv6 routes)');
+          return true;
+        }
+      }
       if (sub === 'interfaces' || sub === 'interface') {
         showInterfaces(parts.slice(2), router, io); return true;
       }
@@ -1208,8 +1280,29 @@
       return true;
     }
 
+    if (verb === 'ping') {
+      // ping ipv6 <addr>
+      if ((parts[1] || '').toLowerCase() === 'ipv6') {
+        const addr = parts[2];
+        if (!addr) { io.println('% Usage: ping ipv6 <addr>'); return true; }
+        if (!window.RouterIpv6) { io.println('% IPv6 not initialized'); return true; }
+        const neighbors = window.RouterIpv6.getNdpNeighbors(router.id);
+        const target = window.RouterIpv6.canonIpv6(addr);
+        const reachable = neighbors.some(n => n.addr === target);
+        io.println(`PING6 ${addr}: 56 data bytes`);
+        for (let i = 1; i <= 5; i++) {
+          if (reachable) io.println(`64 bytes from ${addr}: icmp_seq=${i} ttl=64 time=1.0 ms`);
+          else io.println(`Request timeout for icmp_seq ${i}`);
+        }
+        io.println(`--- ${addr} ping statistics ---`);
+        io.println(`5 packets transmitted, ${reachable ? 5 : 0} received, ${reachable ? 0 : 100}% packet loss`);
+        return true;
+      }
+      // existing ping (IPv4)
+      io.println('% ping not fully supported in emulation'); return true;
+    }
+
     if (verb === 'commit') {
-      // commit from operational mode (some JunOS allows this)
       Storage.write(router.id, 'startup', Storage.read(router.id, 'running'));
       io.println('commit complete');
       return true;
@@ -1409,4 +1502,37 @@
   }
 
   global.RouterJunos = { handleCommand, complete, restoreBgpSessions };
+
+  // IPv6 パーサ登録
+  if (window.RouterIpv6) {
+    window.RouterIpv6.registerOsParser('junos', {
+      getInterfaceAddrs(cfg) {
+        const result = [];
+        const re4 = /^set interfaces (\S+) unit (\d+) family inet address ([\d.]+)\/([\d]+)/gim;
+        const re6 = /^set interfaces (\S+) unit (\d+) family inet6 address ([\w:]+)\/([\d]+)/gim;
+        const map = new Map();
+        let m;
+        while ((m = re4.exec(cfg || ''))) {
+          const key = `${m[1]}.${m[2]}`;
+          if (!map.has(key)) map.set(key, { name: key, ipv4: [], ipv6: [], shutdown: false });
+          map.get(key).ipv4.push({ ip: m[3], prefixLen: parseInt(m[4], 10) });
+        }
+        while ((m = re6.exec(cfg || ''))) {
+          const key = `${m[1]}.${m[2]}`;
+          if (!map.has(key)) map.set(key, { name: key, ipv4: [], ipv6: [], shutdown: false });
+          map.get(key).ipv6.push({ addr: m[3], prefixLen: parseInt(m[4], 10), type: 'global' });
+        }
+        return [...map.values()];
+      },
+      getIpv6StaticRoutes(cfg) {
+        const result = [];
+        const re = /^set routing-options rib inet6\.0 static route ([\w:]+)\/([\d]+) next-hop ([\w:]+)(?:\s+preference\s+(\d+))?/gim;
+        let m;
+        while ((m = re.exec(cfg || ''))) {
+          result.push({ prefix: m[1], prefixLen: parseInt(m[2], 10), nexthop: m[3], ad: m[4] ? parseInt(m[4], 10) : 1 });
+        }
+        return result;
+      },
+    });
+  }
 })(window);

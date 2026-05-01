@@ -674,6 +674,76 @@
     if (vrfs.length === 0) io.println('  (no VRFs configured)');
   };
 
+  // show ipv6 interface / route / neighbors
+  showHandlers['ipv6'] = (args, router, io) => {
+    if (!window.RouterIpv6) { io.println('% IPv6 not initialized'); return; }
+    const Ipv6 = window.RouterIpv6;
+    const sub = _ex(args[0], ['interface','route','neighbors','neighbor']);
+    if (sub === 'interface') {
+      const brief = (args[1] || '').toLowerCase().startsWith('br');
+      const targetIf = !brief && args[1] ? args[1] : null;
+      const ifaces = Ipv6.getInterfaceAddrs(router.id);
+      const list = targetIf ? ifaces.filter(f => f.name.toLowerCase().startsWith(targetIf.toLowerCase())) : ifaces;
+      if (brief) {
+        for (const f of list) {
+          const ll = f.ipv6.find(a => a.type === 'link-local');
+          const globals = f.ipv6.filter(a => a.type !== 'link-local');
+          io.println(f.name.padEnd(19) + '[up/up]       ' + (ll ? ll.addr.toUpperCase() : 'unassigned'));
+          globals.forEach(a => io.println(''.padEnd(33) + a.addr.toUpperCase()));
+        }
+        return;
+      }
+      for (const f of list) {
+        const ll = f.ipv6.find(a => a.type === 'link-local');
+        const globals = f.ipv6.filter(a => a.type !== 'link-local');
+        io.println(`${f.name} is up, line protocol is up`);
+        io.println('  IPv6 is enabled, link-local address is ' + (ll ? ll.addr.toUpperCase() : 'none'));
+        if (globals.length > 0) {
+          io.println('  Global unicast address(es):');
+          globals.forEach(({ addr, prefixLen }) => {
+            const netBig = Ipv6.networkIpv6(addr, prefixLen);
+            io.println(`    ${addr.toUpperCase()}, subnet is ${Ipv6.formatIpv6(netBig).toUpperCase()}/${prefixLen}`);
+          });
+        }
+        io.println('  Joined group address(es):');
+        io.println('    FF02::1');
+        io.println('    FF02::2');
+        if (globals.length > 0) globals.forEach(a => io.println(`    FF02::1:FF${a.addr.slice(-4).toUpperCase()}`));
+      }
+      return;
+    }
+    if (sub === 'route') {
+      const staticOnly = (args[1] || '').toLowerCase().startsWith('st');
+      const routes = Ipv6.getIpv6Routes(router.id);
+      const filtered = staticOnly ? routes.filter(r => r.type === 'S') : routes;
+      io.println(`IPv6 Routing Table - default - ${filtered.length} entries`);
+      filtered.forEach(r => {
+        if (r.type === 'C') {
+          io.println(`C   ${r.prefix.toUpperCase()}/${r.prefixLen} [0/0]`);
+          io.println(`     via ${r.iface}, directly connected`);
+        } else if (r.type === 'L') {
+          io.println(`L   ${r.prefix.toUpperCase()}/${r.prefixLen} [0/0]`);
+          io.println(`     via ${r.iface}, receive`);
+        } else if (r.type === 'S') {
+          io.println(`S   ${r.prefix.toUpperCase()}/${r.prefixLen} [${r.ad}/0]`);
+          io.println(`     via ${r.nexthop.toUpperCase()}`);
+        }
+      });
+      if (filtered.length === 0) io.println('  (no IPv6 routes)');
+      return;
+    }
+    if (sub === 'neighbors' || sub === 'neighbor') {
+      const neighbors = Ipv6.getNdpNeighbors(router.id);
+      io.println('IPv6 Address                            Age  Link-layer Addr  State  Interface');
+      neighbors.forEach(n => {
+        io.println(n.addr.toUpperCase().padEnd(40) + '0    ' + n.mac.padEnd(17) + n.state.padEnd(7) + n.iface);
+      });
+      if (neighbors.length === 0) io.println('  (no NDP neighbors)');
+      return;
+    }
+    io.println(`% Invalid input after 'show ipv6 ${args[0] || ''}'`);
+  };
+
   // ------- フィルタ (| include / exclude / section) -------
   function filterOutput(cfg, op, pat, io) {
     let re;
@@ -752,6 +822,32 @@
       return true;
     });
     Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  // インタフェースブロックに行を追加する（既存の全同一行は除去してから追加）
+  function _appendIfaceLine(router, ifaceName, newLine) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const lines = cfg.split('\n');
+    let inBlock = false, exists = false;
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      const im = t.match(/^interface\s+(\S+)/i);
+      if (im) { inBlock = im[1].toLowerCase() === ifaceName.toLowerCase(); continue; }
+      if (inBlock) {
+        if (/^[^ \t!]/.test(t) && t !== '') { inBlock = false; continue; }
+        if ((t.startsWith(' ') || t.startsWith('\t')) && t.trim() === newLine.trim()) { exists = true; break; }
+      }
+    }
+    if (!exists) {
+      const out = [...lines];
+      const blockIdx = out.findIndex(l => { const m = l.match(/^interface\s+(\S+)/i); return m && m[1].toLowerCase() === ifaceName.toLowerCase(); });
+      if (blockIdx >= 0) {
+        let end = blockIdx + 1;
+        while (end < out.length && (out[end].startsWith(' ') || out[end].startsWith('\t') || out[end] === '')) end++;
+        out.splice(end, 0, ' ' + newLine);
+        Storage.write(router.id, 'running', out.join('\n'));
+      }
+    }
   }
 
   // インタフェースブロックを丸ごと削除する
@@ -1141,8 +1237,8 @@
   // parts[0] = 動詞（'show' / 'write' / ...）
   // モード別動詞候補（prefix 展開用）
   const _ECANDS = ['configure','clear','copy','disable','enable','exit','help','load-config','no','ping','send','show','write'];
-  const _CCANDS = ['do','end','exit','hostname','interface','ip','isis','mpls','no','router','vrf'];
-  const _ICANDS = ['description','do','end','exit','ip','isis','mpls','no','shutdown','vrf'];
+  const _CCANDS = ['do','end','exit','hostname','interface','ip','ipv6','isis','mpls','no','router','vrf'];
+  const _ICANDS = ['description','do','end','exit','ip','ipv6','isis','mpls','no','shutdown','vrf'];
   const _BCANDS = ['bgp','do','end','exit','neighbor','network','no','router-id'];
   const _VDEFCANDS = ['address-family', 'exit-address-family', 'rd', 'route-target', 'no', 'exit', 'end'];
 
@@ -1337,6 +1433,34 @@
         if (verb === 'no' && /^ospf$/i.test(parts[1] || '') && _ex(parts[2], ['prefix-sid']) === 'prefix-sid') {
           _removeIfaceLine(router, ifaceName, /^ospf prefix-sid\s+/i);
           if (window.RouterSr) window.RouterSr.recalculate();
+          return true;
+        }
+
+        // ipv6 address <addr>/<prefixLen>
+        if (verb === 'ipv6' && (parts[1] || '').toLowerCase() === 'address') {
+          const raw = parts[2];
+          if (!raw) { io.println('% Incomplete command.'); return true; }
+          if (raw.includes('/')) {
+            const [addr, lenStr] = raw.split('/');
+            if (!addr || !lenStr) { io.println('% Invalid IPv6 address format'); return true; }
+            _appendIfaceLine(router, ifaceName, `ipv6 address ${addr}/${lenStr}`);
+          } else if (parts[3] && /^link-local$/i.test(parts[3])) {
+            _updateIfaceLine(router, ifaceName, /^ipv6 address\s+\S+\s+link-local/i, `ipv6 address ${raw} link-local`);
+          } else {
+            io.println('% Invalid IPv6 address format'); return true;
+          }
+          return true;
+        }
+
+        // no ipv6 address <addr>/<prefixLen>  |  no ipv6 address
+        if (verb === 'no' && (parts[1] || '').toLowerCase() === 'ipv6' && (parts[2] || '').toLowerCase() === 'address') {
+          const target = parts[3];
+          if (target) {
+            const escaped = target.replace(/\//g, '\\/').replace(/\./g, '\\.');
+            _removeIfaceLine(router, ifaceName, new RegExp(`^ipv6 address\\s+${escaped}$`, 'i'));
+          } else {
+            _removeIfaceLine(router, ifaceName, /^ipv6 address\s+/i);
+          }
           return true;
         }
 
@@ -1774,6 +1898,30 @@
         return true;
       }
 
+      // ipv6 route <prefix/len> <nexthop> [ad]
+      if (verb === 'ipv6' && _ex(parts[1], ['route']) === 'route') {
+        const cidr = parts[2], nexthop = parts[3];
+        if (!cidr || !cidr.includes('/') || !nexthop) { io.println('% Incomplete command.'); return true; }
+        const [prefix, lenStr] = cidr.split('/');
+        const ad = parts[4] && /^\d+$/.test(parts[4]) ? ` ${parts[4]}` : '';
+        const newLine = `ipv6 route ${prefix}/${lenStr} ${nexthop}${ad}`;
+        const cfg2 = Storage.read(router.id, 'running') || '';
+        const re2 = new RegExp(`^ipv6 route\\s+${prefix.replace(/:/g, '\\:')}\\/${lenStr}\\s+\\S+.*$`, 'im');
+        Storage.write(router.id, 'running', re2.test(cfg2) ? cfg2.replace(re2, newLine) : cfg2.trimEnd() + '\n' + newLine + '\n');
+        return true;
+      }
+
+      // no ipv6 route <prefix/len>
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip','ipv6']) === 'ipv6' && _ex(parts[2], ['route']) === 'route') {
+        const cidr = parts[3];
+        if (!cidr || !cidr.includes('/')) { io.println('% Incomplete command.'); return true; }
+        const [prefix, lenStr] = cidr.split('/');
+        const cfg2 = Storage.read(router.id, 'running') || '';
+        const re2 = new RegExp(`^ipv6 route\\s+${prefix.replace(/:/g, '\\:')}\\/${lenStr}.*\\n?`, 'im');
+        Storage.write(router.id, 'running', cfg2.replace(re2, ''));
+        return true;
+      }
+
       io.println(`% Invalid input in config mode: ${parts.join(' ')}`);
       return true;
     }
@@ -1801,7 +1949,7 @@
 
     // --- show ---
     if (verb === 'show' || verb === 'sh') {
-      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','ip','arp','interfaces','ospf','clock','history','isis','clns','vrf','mpls','segment-routing'];
+      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','ip','ipv6','arp','interfaces','ospf','clock','history','isis','clns','vrf','mpls','segment-routing'];
       const sub = _ex(parts[1], _SHOW_KEYS);
       if (!sub) {
         io.println('% Incomplete command. Type "show ?" for help.');
@@ -1853,6 +2001,22 @@
         return true;
       }
       io.println(`% copy ${src} ${dst} is not supported in emulation`);
+      return true;
+    }
+
+    // --- ping ipv6 ---
+    if (verb === 'ping' && (parts[1] || '').toLowerCase() === 'ipv6') {
+      const addr = parts[2];
+      if (!addr) { io.println('% Usage: ping ipv6 <addr>'); return true; }
+      if (!window.RouterIpv6) { io.println('% IPv6 not initialized'); return true; }
+      const neighbors = window.RouterIpv6.getNdpNeighbors(router.id);
+      const target = window.RouterIpv6.canonIpv6(addr);
+      const reachable = neighbors.some(n => n.addr === target);
+      io.println('Type escape sequence to abort.');
+      io.println(`Sending 5, 100-byte ICMP Echos to ${addr}`);
+      io.println(reachable ? '!!!!!' : '.....');
+      io.println('');
+      io.println(`Success rate is ${reachable ? 100 : 0} percent (${reachable ? '5/5' : '0/5'})`);
       return true;
     }
 
@@ -2247,6 +2411,35 @@
 
   // すべての OS パーサが登録されたあとに IS-IS / OSPF / MPLS / SR ルートを復元する
   setTimeout(() => { RouterIsis.restoreAll(); RouterOspf.restoreAll(); if (window.RouterMpls) window.RouterMpls.restoreAll(); if (window.RouterSr) window.RouterSr.restoreAll(); }, 0);
+
+  // IPv6 パーサ登録
+  if (window.RouterIpv6) {
+    window.RouterIpv6.registerOsParser('ios-xe', {
+      getInterfaceAddrs(cfg) {
+        return parseInterfaces(cfg).map(blk => {
+          const ipv4 = [], ipv6 = [];
+          for (const l of blk.lines) {
+            const m4 = l.match(/^ip\s+address\s+([\d.]+)\s+([\d.]+)/i);
+            if (m4) { ipv4.push({ ip: m4[1], prefixLen: maskToPrefix(m4[2]) }); continue; }
+            const m6g = l.match(/^ipv6\s+address\s+([\w:]+)\/([\d]+)/i);
+            if (m6g) { ipv6.push({ addr: m6g[1], prefixLen: parseInt(m6g[2], 10), type: 'global' }); continue; }
+            const m6l = l.match(/^ipv6\s+address\s+([\w:]+)\s+link-local/i);
+            if (m6l) { ipv6.push({ addr: m6l[1], prefixLen: 10, type: 'link-local' }); }
+          }
+          return { name: blk.name, ipv4, ipv6, shutdown: isIfShutdown(blk) };
+        });
+      },
+      getIpv6StaticRoutes(cfg) {
+        const result = [];
+        const re = /^ipv6\s+route\s+([\w:]+)\/([\d]+)\s+([\w:]+)(?:\s+(\d+))?/gim;
+        let m;
+        while ((m = re.exec(cfg || ''))) {
+          result.push({ prefix: m[1], prefixLen: parseInt(m[2], 10), nexthop: m[3], ad: m[4] ? parseInt(m[4], 10) : 1 });
+        }
+        return result;
+      },
+    });
+  }
 
   global.RouterIosXe = { handleCommand, complete, restoreBgpSessions };
 })(window);
