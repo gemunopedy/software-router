@@ -103,14 +103,16 @@
   function buildPrompt(router, state) {
     const host = getHostname(router);
     if (router.os === 'ios-xe') {
-      if (state && state.configMode === 'if')     return host + '(config-if)# ';
-      if (state && state.configMode === 'router') return host + '(config-router)# ';
-      if (state && state.configMode === 'global') return host + '(config)# ';
+      if (state && state.configMode === 'if')      return host + '(config-if)# ';
+      if (state && state.configMode === 'router')  return host + '(config-router)# ';
+      if (state && state.configMode === 'vrf-def') return host + '(config-vrf)# ';
+      if (state && state.configMode === 'global')  return host + '(config)# ';
       return host + '# ';
     }
     if (router.os === 'ios-xr') {
       if (state && state.configMode === 'if')     return 'RP/0/RP0/CPU0:' + host + '(config-if)# ';
       if (state && state.configMode === 'router') return 'RP/0/RP0/CPU0:' + host + '(config-bgp)# ';
+      if (state && state.configMode === 'vrf')    return 'RP/0/RP0/CPU0:' + host + '(config-vrf)# ';
       if (state && state.configMode === 'global') return 'RP/0/RP0/CPU0:' + host + '(config)# ';
       return 'RP/0/RP0/CPU0:' + host + '# ';
     }

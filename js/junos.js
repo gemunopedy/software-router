@@ -91,6 +91,36 @@
     return result;
   }
 
+  function getRoutingInstances(cfg) {
+    const result = [];
+    const lines = (cfg || '').split('\n');
+    for (const raw of lines) {
+      const t = raw.trim();
+      const m = t.match(/^set routing-instances\s+(\S+)\s+instance-type\s+/i);
+      if (m) {
+        if (!result.find(r => r.name === m[1])) {
+          result.push({ name: m[1], rd: '', importPolicies: [], exportPolicies: [], ifaces: [] });
+        }
+        continue;
+      }
+      const rdM = t.match(/^set routing-instances\s+(\S+)\s+route-distinguisher\s+(\S+)/i);
+      if (rdM) {
+        let r2 = result.find(r => r.name === rdM[1]);
+        if (!r2) { r2 = { name: rdM[1], rd: '', importPolicies: [], exportPolicies: [], ifaces: [] }; result.push(r2); }
+        r2.rd = rdM[2];
+        continue;
+      }
+      const ifM = t.match(/^set routing-instances\s+(\S+)\s+interface\s+(\S+)/i);
+      if (ifM) {
+        let r2 = result.find(r => r.name === ifM[1]);
+        if (!r2) { r2 = { name: ifM[1], rd: '', importPolicies: [], exportPolicies: [], ifaces: [] }; result.push(r2); }
+        if (!r2.ifaces.includes(ifM[2])) r2.ifaces.push(ifM[2]);
+        continue;
+      }
+    }
+    return result;
+  }
+
   function getBgpAs(cfg) {
     const m = (cfg || '').match(/^set routing-options autonomous-system\s+(\d+)/im);
     return m ? parseInt(m[1], 10) : 65000;
@@ -568,6 +598,46 @@
       }
     }
 
+    if (cat === 'routing-instances') {
+      const instName = rest[0];
+      if (!instName) { io.println('% Incomplete: instance name required'); return true; }
+      const restStr = rest.slice(1);
+      const key = (restStr[0] || '').toLowerCase();
+      if (key === 'instance-type') {
+        _setLine(router, `set routing-instances ${instName} instance-type ${restStr[1] || 'vrf'}`);
+        return true;
+      }
+      if (key === 'route-distinguisher' && restStr[1]) {
+        _deleteLines(router, new RegExp(`^set routing-instances ${instName} route-distinguisher\\s+`, 'i'));
+        _setLine(router, `set routing-instances ${instName} route-distinguisher ${restStr[1]}`);
+        return true;
+      }
+      if (key === 'interface' && restStr[1]) {
+        _setLine(router, `set routing-instances ${instName} interface ${restStr[1]}`);
+        return true;
+      }
+      if (key === 'vrf-import' && restStr[1]) {
+        _setLine(router, `set routing-instances ${instName} vrf-import ${restStr[1]}`);
+        return true;
+      }
+      if (key === 'vrf-export' && restStr[1]) {
+        _setLine(router, `set routing-instances ${instName} vrf-export ${restStr[1]}`);
+        return true;
+      }
+      if (key === 'routing-options' && (restStr[1] || '').toLowerCase() === 'static' && (restStr[2] || '').toLowerCase() === 'route') {
+        const cidr = restStr[3];
+        if (!cidr || !cidr.includes('/')) { io.println('% Incomplete command.'); return true; }
+        const nhIdx = restStr.findIndex(w => w.toLowerCase() === 'next-hop');
+        if (nhIdx < 0 || !restStr[nhIdx + 1]) { io.println('% next-hop required'); return true; }
+        const nexthop = restStr[nhIdx + 1];
+        _deleteLines(router, new RegExp(`^set routing-instances ${instName} routing-options static route ${cidr.replace(/\./g,'\\.').replace('/','\/')} next-hop\\s+`, 'i'));
+        _setLine(router, `set routing-instances ${instName} routing-options static route ${cidr} next-hop ${nexthop}`);
+        return true;
+      }
+      io.println(`% Unknown routing-instances sub-command: ${restStr.join(' ')}`);
+      return true;
+    }
+
     io.println(`% Unknown set path: ${parts.slice(1).join(' ')}`);
     return true;
   }
@@ -668,6 +738,29 @@
       }
     }
 
+    if (cat === 'routing-instances') {
+      const instName = rest[0];
+      if (!instName) { io.println('% Incomplete: instance name required'); return true; }
+      if (rest[1]) {
+        const key = (rest[1] || '').toLowerCase();
+        if (key === 'interface' && rest[2]) {
+          _deleteLines(router, new RegExp(`^set routing-instances ${instName} interface ${rest[2].replace(/\//g,'\\/')}$`, 'i'));
+          return true;
+        }
+        if (key === 'route-distinguisher') {
+          _deleteLines(router, new RegExp(`^set routing-instances ${instName} route-distinguisher\\s+`, 'i'));
+          return true;
+        }
+        if (key === 'routing-options' && rest[2] && rest[3] && rest[4]) {
+          const cidr = rest[4];
+          _deleteLines(router, new RegExp(`^set routing-instances ${instName} routing-options static route ${cidr.replace(/\./g,'\\.').replace('/','\/')}\\s+`, 'i'));
+          return true;
+        }
+      }
+      _deleteLines(router, new RegExp(`^set routing-instances ${instName}(\\s+.*)?$`, 'i'));
+      return true;
+    }
+
     io.println(`% Unknown delete path: ${parts.slice(1).join(' ')}`);
     return true;
   }
@@ -693,7 +786,7 @@
       if (verb === 'top') { return true; } // already at top
 
       if (verb === 'show') {
-        const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf'];
+        const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances'];
         const sub = _ex(parts[1], _SHOW_J);
         if (!sub || sub === '|' || sub === 'all') { showConfig(router, io); return true; }
         // show interfaces etc. from config mode
@@ -746,7 +839,7 @@
     }
 
     if (verb === 'show') {
-      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf'];
+      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances'];
       const sub = _ex(parts[1], _SHOW_J);
       if (sub === 'interfaces' || sub === 'interface') {
         showInterfaces(parts.slice(2), router, io); return true;
@@ -755,6 +848,50 @@
         showBgp(parts.slice(2), router, io); return true;
       }
       if (sub === 'route') {
+        if ((parts[2] || '').toLowerCase() === 'table' && parts[3]) {
+          const tableName = parts[3];
+          const instName = tableName.replace(/\.inet\.0$/i, '');
+          if (instName !== tableName) {
+            const cfg = Storage.read(router.id, 'running') || '';
+            const insts = getRoutingInstances(cfg);
+            const inst = insts.find(i => i.name === instName);
+            if (!inst) { io.println(`% Routing table ${tableName} not found`); return true; }
+            const instCands = [];
+            const re2 = new RegExp(`^set routing-instances ${instName} routing-options static route ([\\d.]+\\/\\d+) next-hop ([\\d.]+)(?:\\s+preference\\s+(\\d+))?`, 'gim');
+            let m2;
+            while ((m2 = re2.exec(cfg))) {
+              const [pfx, lenStr] = m2[1].split('/');
+              instCands.push({ type: 'Static', prefix: pfx, prefixLen: parseInt(lenStr), ad: m2[3] ? parseInt(m2[3]) : 1, nexthop: m2[2] });
+            }
+            const allIfaces = getInterfaces(cfg);
+            inst.ifaces.forEach(ifName => {
+              const f = allIfaces.find(x => x.name === ifName);
+              if (!f) return;
+              const netOcts = f.ip.split('.').map(Number);
+              const maskOcts = f.mask.split('.').map(Number);
+              const net = netOcts.map((b, i) => b & maskOcts[i]).join('.');
+              instCands.push({ type: 'Direct', prefix: net, prefixLen: f.prefixLen, ad: 0, metric: 0, via: f.name });
+              instCands.push({ type: 'Local',  prefix: f.ip, prefixLen: 32,          ad: 0, metric: 0, via: f.name });
+            });
+            io.println('');
+            io.println(`${tableName}: routes`);
+            io.println('');
+            if (instCands.length === 0) { io.println(`% No routes in table ${tableName}`); return true; }
+            RouterRib.selectBest(instCands).forEach(r => {
+              if (r.type === 'Direct') {
+                io.println(`${r.prefix}/${r.prefixLen}            *[Direct/0] preference 0`);
+                io.println(`                    > via ${r.via}`);
+              } else if (r.type === 'Local') {
+                io.println(`${r.prefix}/${r.prefixLen}              *[Local/0] preference 0`);
+                io.println(`                      Local via ${r.via}`);
+              } else if (r.type === 'Static') {
+                io.println(`${r.prefix}/${r.prefixLen}       *[Static/${r.ad}] preference ${r.ad}`);
+                io.println(`                    > to ${r.nexthop}`);
+              }
+            });
+            return true;
+          }
+        }
         showRoute(parts.slice(2), router, io); return true;
       }
       if (sub === 'configuration') {
@@ -812,6 +949,16 @@
       }
       if (sub === 'ospf') {
         showOspf(parts.slice(2), router, io); return true;
+      }
+      if (sub === 'routing-instances') {
+        const cfg = Storage.read(router.id, 'running') || '';
+        const insts = getRoutingInstances(cfg);
+        io.println('Instance               Type            RD                    Ifaces');
+        insts.forEach(inst => {
+          io.println(inst.name.padEnd(23) + 'vrf'.padEnd(16) + (inst.rd || 'not set').padEnd(22) + inst.ifaces.join(', '));
+        });
+        if (insts.length === 0) io.println('(no routing instances configured)');
+        return true;
       }
       io.println(`% Unknown show command: ${sub}`);
       return true;

@@ -102,6 +102,46 @@
     return result;
   }
 
+  function getVrfDefinitions(cfg) {
+    const result = [];
+    const lines = (cfg || '').split('\n');
+    let cur = null;
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      const m = t.match(/^vrf definition\s+(\S+)/i);
+      if (m) { cur = { name: m[1], rd: '', importRTs: [], exportRTs: [] }; result.push(cur); continue; }
+      if (!cur) continue;
+      if (/^[^ \t!]/.test(t) && t !== '') { cur = null; continue; }
+      const line = t.trim();
+      if (/^address-family\s+ipv4/i.test(line) || /^exit-address-family/i.test(line) || line === '!') continue;
+      if (/^rd\s+/i.test(line)) { cur.rd = line.replace(/^rd\s+/i, ''); continue; }
+      const imp = line.match(/^route-target\s+import\s+(\S+)/i);
+      if (imp) { cur.importRTs.push(imp[1]); continue; }
+      const exp = line.match(/^route-target\s+export\s+(\S+)/i);
+      if (exp) { cur.exportRTs.push(exp[1]); continue; }
+    }
+    return result;
+  }
+
+  function getIfVrf(iface) {
+    for (const l of iface.lines) {
+      const m = l.match(/^vrf forwarding\s+(\S+)/i);
+      if (m) return m[1];
+    }
+    return null;
+  }
+
+  function getVrfStaticRoutes(cfg, vrfName) {
+    const result = [];
+    const escaped = vrfName.replace(/[-/]/g, '[-\\/]');
+    const re = new RegExp(`^ip route vrf\\s+${escaped}\\s+([\\d.]+)\\s+([\\d.]+)\\s+([\\d.]+)(?:\\s+(\\d+))?`, 'gim');
+    let m;
+    while ((m = re.exec(cfg || ''))) {
+      result.push({ prefix: m[1], mask: m[2], nexthop: m[3], ad: m[4] ? parseInt(m[4]) : 1 });
+    }
+    return result;
+  }
+
   // 行中の hostname を取得
   function getHostname(cfg) {
     const m = cfg.match(/^hostname\s+(\S+)/im);
@@ -228,7 +268,7 @@
 
   // show ip interface brief
   showHandlers['ip'] = (args, router, io) => {
-    const sub = _ex(args[0], ['interface','route','bgp','ospf']);
+    const sub = _ex(args[0], ['interface','route','bgp','ospf','vrf']);
     const cfg = readCfg(router);
 
     if (sub === 'interface' && (args[1] || '').match(/^br/i)) {
@@ -270,6 +310,36 @@
     }
 
     if (sub === 'route') {
+      if (args[1] && args[1].toLowerCase() === 'vrf' && args[2]) {
+        const vrfName = args[2];
+        const vrfCands = [];
+        parseInterfaces(cfg).forEach(iface => {
+          if (getIfVrf(iface) !== vrfName) return;
+          const ipInfo = getIfIp(iface);
+          if (!ipInfo) return;
+          const prefixLen = maskToPrefix(ipInfo.mask);
+          const ipParts  = ipInfo.ip.split('.').map(Number);
+          const maskParts = ipInfo.mask.split('.').map(Number);
+          const net = ipParts.map((b, i) => b & maskParts[i]).join('.');
+          vrfCands.push({ type: 'C', prefix: net,       prefixLen, ad: 0, metric: 0, via: iface.name });
+          vrfCands.push({ type: 'L', prefix: ipInfo.ip, prefixLen: 32, ad: 0, metric: 0, via: iface.name });
+        });
+        getVrfStaticRoutes(cfg, vrfName).forEach(e => {
+          vrfCands.push({ type: 'S', prefix: e.prefix, prefixLen: maskToPrefix(e.mask), ad: e.ad, metric: 0, nexthop: e.nexthop });
+        });
+        io.println(`Routing Table: ${vrfName}`);
+        io.println('Codes: C - connected, S - static, R - RIP, I - ISIS, O - OSPF, B - BGP');
+        io.println('');
+        if (vrfCands.length === 0) { io.println(`% No routes in VRF ${vrfName}`); return; }
+        io.println('Gateway of last resort is not set');
+        io.println('');
+        RouterRib.selectBest(vrfCands).forEach(r => {
+          if (r.type === 'C') io.println(`C     ${r.prefix}/${r.prefixLen} is directly connected, ${r.via}`);
+          else if (r.type === 'L') io.println(`L     ${r.prefix}/${r.prefixLen} is directly connected, ${r.via}`);
+          else if (r.type === 'S') io.println(`S     ${r.prefix}/${r.prefixLen} [${r.ad}/0] via ${r.nexthop}`);
+        });
+        return;
+      }
       // show ip route – AD選択ベース
       io.println('Codes: C - connected, S - static, R - RIP, I - ISIS, O - OSPF, B - BGP');
       io.println('       D - EIGRP, EX - EIGRP external, O - OSPF, ...');
@@ -281,6 +351,7 @@
       parseInterfaces(cfg).forEach(iface => {
         const ipInfo = getIfIp(iface);
         if (!ipInfo) return;
+        if (getIfVrf(iface)) return;
         const prefixLen = maskToPrefix(ipInfo.mask);
         const ipParts  = ipInfo.ip.split('.').map(Number);
         const maskParts = ipInfo.mask.split('.').map(Number);
@@ -319,6 +390,11 @@
 
     if (sub === 'ospf') {
       _showOspf(args.slice(1), router, io);
+      return;
+    }
+
+    if (sub === 'vrf') {
+      showHandlers['vrf'](args.slice(1), router, io);
       return;
     }
 
@@ -477,6 +553,20 @@
   showHandlers['clns'] = (args, router, io) => {
     if (_ex(args[0], ['neighbors']) === 'neighbors') showHandlers['isis'](['neighbors'], router, io);
     else io.println(`% Unrecognized 'show clns ${args[0]}'`);
+  };
+
+  showHandlers['vrf'] = (args, router, io) => {
+    const cfg = readCfg(router);
+    const vrfs = getVrfDefinitions(cfg);
+    io.println('  Name                             Default RD          Protocols   Interfaces');
+    vrfs.forEach(vrf => {
+      const ifaces = parseInterfaces(cfg)
+        .filter(iface => getIfVrf(iface) === vrf.name)
+        .map(iface => iface.name)
+        .join(', ');
+      io.println('  ' + vrf.name.padEnd(33) + (vrf.rd || 'not set').padEnd(20) + 'ipv4        ' + ifaces);
+    });
+    if (vrfs.length === 0) io.println('  (no VRFs configured)');
   };
 
   // ------- フィルタ (| include / exclude / section) -------
@@ -674,6 +764,75 @@
     Storage.write(router.id, 'running', out.join('\n'));
   }
 
+  function _updateVrfLine(router, vrfName, matchRe, newLine) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^vrf definition\\s+${vrfName.replace(/[-/]/g, '[-\\/]')}\\s*$`, 'i');
+    const lines = cfg.split('\n');
+    let inBlock = false, replaced = false;
+    const out = [];
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { inBlock = true; out.push(t); continue; }
+      if (inBlock) {
+        if (/^[^ \t!]/.test(t) && t !== '') { inBlock = false; }
+        else if (t.startsWith(' ') || t.startsWith('\t')) {
+          if (matchRe.test(t.trim())) { out.push(' ' + newLine); replaced = true; continue; }
+        }
+      }
+      out.push(t);
+    }
+    if (!replaced) {
+      const insertIdx = out.findIndex(l => headerRe.test(l.trimEnd()));
+      if (insertIdx >= 0) {
+        let end = insertIdx + 1;
+        while (end < out.length && (out[end].startsWith(' ') || out[end].startsWith('\t')) &&
+               !/^address-family/i.test(out[end].trim())) end++;
+        out.splice(end, 0, ' ' + newLine);
+      }
+    }
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  function _removeVrfLine(router, vrfName, matchRe) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^vrf definition\\s+${vrfName.replace(/[-/]/g, '[-\\/]')}\\s*$`, 'i');
+    let inBlock = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { inBlock = true; return true; }
+      if (inBlock && (t.startsWith(' ') || t.startsWith('\t'))) return !matchRe.test(t.trim());
+      if (inBlock && /^[^ \t!]/.test(t) && t !== '') inBlock = false;
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  function _removeVrfBlock(router, vrfName) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^vrf definition\\s+${vrfName.replace(/[-/]/g, '[-\\/]')}\\s*$`, 'i');
+    let skip = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { skip = true; return false; }
+      if (skip) {
+        if (t.startsWith(' ') || t.startsWith('\t') || t === '') return false;
+        skip = false;
+      }
+      return true;
+    });
+    const cfg2 = out.join('\n');
+    const fwdRe = new RegExp(`^vrf forwarding\\s+${vrfName.replace(/[-/]/g, '[-\\/]')}\\s*$`, 'i');
+    let inIface = false;
+    const out2 = cfg2.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (/^interface\s+/i.test(t)) { inIface = true; return true; }
+      if (inIface && (t.startsWith(' ') || t.startsWith('\t'))) return !fwdRe.test(t.trim());
+      if (inIface && /^[^ \t!]/.test(t) && t !== '') inIface = false;
+      return true;
+    });
+    Storage.write(router.id, 'running', out2.join('\n'));
+  }
+
   // ------- show running-config 整形出力 -------
   // interface ブロックを Loopback → それ以外 (GigabitEthernet 等) の順に並び替えて出力
   function printRunningConfig(cfg, router, io) {
@@ -825,14 +984,16 @@
   // parts[0] = 動詞（'show' / 'write' / ...）
   // モード別動詞候補（prefix 展開用）
   const _ECANDS = ['configure','clear','copy','disable','enable','exit','help','load-config','no','ping','send','show','write'];
-  const _CCANDS = ['do','end','exit','hostname','interface','ip','isis','no','router'];
-  const _ICANDS = ['description','do','end','exit','ip','isis','no','shutdown'];
+  const _CCANDS = ['do','end','exit','hostname','interface','ip','isis','no','router','vrf'];
+  const _ICANDS = ['description','do','end','exit','ip','isis','no','shutdown','vrf'];
   const _BCANDS = ['bgp','do','end','exit','neighbor','network','no','router-id'];
+  const _VDEFCANDS = ['address-family', 'exit-address-family', 'rd', 'route-target', 'no', 'exit', 'end'];
 
   function handleCommand(parts, state, io) {
     const router = state.router;
     const _vcands = state.configMode === 'if' ? _ICANDS
                   : state.configMode === 'router' ? _BCANDS
+                  : state.configMode === 'vrf-def' ? _VDEFCANDS
                   : state.configMode ? _CCANDS
                   : _ECANDS;
     const verb = _ex(parts[0], _vcands);
@@ -848,13 +1009,15 @@
       if (verb === 'end') {
         state.configMode = null;
         state.configIface = null;
+        state.configVrf = null;
         return true;
       }
       if (verb === 'exit') {
-        if (state.configMode === 'if' || state.configMode === 'router') {
+        if (state.configMode === 'if' || state.configMode === 'router' || state.configMode === 'vrf-def') {
           state.configMode = 'global';
           state.configIface = null;
           state.configRouter = null;
+          state.configVrf = null;
         } else {
           state.configMode = null;
         }
@@ -962,6 +1125,19 @@
             _removeIfaceLine(router, ifaceName, /^ip ospf\s+\d+\s+area\s+/i);
           }
           RouterOspf.recalculate(router.id);
+          return true;
+        }
+
+        // vrf forwarding <name>
+        if (verb === 'vrf' && (parts[1] || '').toLowerCase() === 'forwarding') {
+          const vrfName = parts[2];
+          if (!vrfName) { io.println('% Incomplete command.'); return true; }
+          _updateIfaceLine(router, ifaceName, /^vrf forwarding\s+/i, `vrf forwarding ${vrfName}`);
+          return true;
+        }
+        // no vrf forwarding
+        if (verb === 'no' && _ex(parts[1], ['vrf','ip','description','shutdown']) === 'vrf') {
+          _removeIfaceLine(router, ifaceName, /^vrf forwarding\s+/i);
           return true;
         }
 
@@ -1110,6 +1286,51 @@
         return true;
       }
 
+      // ---------- config-vrf-def モード ----------
+      if (state.configMode === 'vrf-def') {
+        const vrfName = state.configVrf;
+        if (verb === 'rd') {
+          const val = parts[1];
+          if (!val) { io.println('% Incomplete command.'); return true; }
+          _updateVrfLine(router, vrfName, /^rd\s+/i, `rd ${val}`);
+          return true;
+        }
+        if (verb === 'address-family' || verb === 'exit-address-family') { return true; }
+        if (verb === 'route-target') {
+          const dir = (parts[1] || '').toLowerCase(), rt = parts[2];
+          if ((dir !== 'import' && dir !== 'export') || !rt) {
+            io.println('% Usage: route-target import|export <rt>'); return true;
+          }
+          const newLine = `route-target ${dir} ${rt}`;
+          const cfg2 = Storage.read(router.id, 'running') || '';
+          const headerRe2 = new RegExp(`^vrf definition\\s+${vrfName.replace(/[-/]/g, '[-\\/]')}\\s*$`, 'i');
+          let inBlk = false, exists2 = false;
+          for (const raw of cfg2.split('\n')) {
+            const t = raw.trimEnd();
+            if (headerRe2.test(t)) { inBlk = true; continue; }
+            if (inBlk) {
+              if (/^[^ \t!]/.test(t) && t !== '') break;
+              if (t.trim().toLowerCase() === newLine.toLowerCase()) { exists2 = true; break; }
+            }
+          }
+          if (!exists2) _updateVrfLine(router, vrfName, /^\x00/, newLine);
+          return true;
+        }
+        if (verb === 'no') {
+          const sub2 = _ex(parts[1], ['rd', 'route-target']);
+          if (sub2 === 'rd') { _removeVrfLine(router, vrfName, /^rd\s+/i); return true; }
+          if (sub2 === 'route-target') {
+            const dir = (parts[2] || '').toLowerCase(), rt = parts[3];
+            if (!rt) { io.println('% Incomplete command.'); return true; }
+            const matchRe2 = new RegExp(`^route-target\\s+${dir}\\s+${rt.replace(/[.:]/g, '\\$&')}\\s*$`, 'i');
+            _removeVrfLine(router, vrfName, matchRe2);
+            return true;
+          }
+        }
+        io.println(`% Invalid input in config-vrf: ${parts.join(' ')}`);
+        return true;
+      }
+
       // ---------- global config モード ----------
 
       // interface <name>
@@ -1223,6 +1444,18 @@
         return true;
       }
 
+      // ip route vrf <name> <prefix> <mask> <nexthop> [<ad>]
+      if (verb === 'ip' && _ex(parts[1], ['route','address']) === 'route' && (parts[2] || '').toLowerCase() === 'vrf') {
+        const vrfName = parts[3], prefix = parts[4], mask = parts[5], nexthop = parts[6];
+        if (!vrfName || !prefix || !mask || !nexthop) { io.println('% Incomplete command.'); return true; }
+        const adStr = parts[7] && /^\d+$/.test(parts[7]) ? ` ${parts[7]}` : '';
+        const cfg2 = Storage.read(router.id, 'running') || '';
+        const re2 = new RegExp(`^ip route vrf\\s+${vrfName}\\s+${prefix.replace(/\./g,'\\.')}\\s+${mask.replace(/\./g,'\\.')}\\s+\\S+.*$`, 'im');
+        const newLine = `ip route vrf ${vrfName} ${prefix} ${mask} ${nexthop}${adStr}`;
+        Storage.write(router.id, 'running', re2.test(cfg2) ? cfg2.replace(re2, newLine) : cfg2.trimEnd() + '\n' + newLine + '\n');
+        return true;
+      }
+
       // ip route <prefix> <mask> <nexthop> [<ad>]
       if (verb === 'ip' && _ex(parts[1], ['route','address']) === 'route') {
         const prefix = parts[2], mask = parts[3], nexthop = parts[4];
@@ -1240,6 +1473,17 @@
         return true;
       }
 
+      // no ip route vrf <name> <prefix> <mask>
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'ip' &&
+          _ex(parts[2], ['route']) === 'route' && (parts[3] || '').toLowerCase() === 'vrf') {
+        const vrfName = parts[4], prefix = parts[5], mask = parts[6];
+        if (!vrfName || !prefix || !mask) { io.println('% Incomplete command.'); return true; }
+        const cfg2 = Storage.read(router.id, 'running') || '';
+        const re2 = new RegExp(`^ip route vrf\\s+${vrfName}\\s+${prefix.replace(/\./g,'\\.')}\\s+${mask.replace(/\./g,'\\.')}.*\\n?`, 'im');
+        Storage.write(router.id, 'running', cfg2.replace(re2, ''));
+        return true;
+      }
+
       // no ip route <prefix> <mask> [<nexthop>]
       if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'ip' &&
           _ex(parts[2], ['route']) === 'route') {
@@ -1249,6 +1493,32 @@
         const re = new RegExp(`^ip route\\s+${prefix.replace(/\./g,'\\.')}\\s+${mask.replace(/\./g,'\\.')}.*\\n?`, 'im');
         Storage.write(router.id, 'running', cfg.replace(re, ''));
         return true;
+      }
+
+      // vrf definition <name>
+      if (verb === 'vrf') {
+        if (_ex(parts[1], ['definition']) === 'definition') {
+          const vrfName = parts[2];
+          if (!vrfName) { io.println('% Incomplete command.'); return true; }
+          const cfg2 = Storage.read(router.id, 'running') || '';
+          if (!new RegExp(`^vrf definition\\s+${vrfName}\\s*$`, 'im').test(cfg2)) {
+            Storage.write(router.id, 'running', cfg2.trimEnd() + `\nvrf definition ${vrfName}\n address-family ipv4\n exit-address-family\n`);
+          }
+          state.configMode = 'vrf-def';
+          state.configVrf = vrfName;
+          return true;
+        }
+        io.println(`% Invalid input after 'vrf'`);
+        return true;
+      }
+      // no vrf definition <name>
+      if (verb === 'no' && _ex(parts[1], ['vrf']) === 'vrf') {
+        if (_ex(parts[2], ['definition']) === 'definition') {
+          const vrfName = parts[3];
+          if (!vrfName) { io.println('% Incomplete command.'); return true; }
+          _removeVrfBlock(router, vrfName);
+          return true;
+        }
       }
 
       io.println(`% Invalid input in config mode: ${parts.join(' ')}`);
@@ -1278,7 +1548,7 @@
 
     // --- show ---
     if (verb === 'show' || verb === 'sh') {
-      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','ip','arp','interfaces','ospf','clock','history','isis','clns'];
+      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','ip','arp','interfaces','ospf','clock','history','isis','clns','vrf'];
       const sub = _ex(parts[1], _SHOW_KEYS);
       if (!sub) {
         io.println('% Incomplete command. Type "show ?" for help.');
