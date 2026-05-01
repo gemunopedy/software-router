@@ -49,6 +49,27 @@
   // 'routerId' → [{prefix, prefixLen, nextHop, asPath, origin, neighborIp, selected}]
   const _bgpRib = new Map();
 
+  // ---- localStorage キー ----
+  const _sessKey = tk => 'bgp_sess:' + tk;
+  const _ribKey  = rid => 'bgp_rib:' + rid;
+
+  function _persistSession(timerKey, info, reverseTk, reverseInfo) {
+    const { keepaliveTimer: _k1, ...sessInfo }    = info;
+    const { keepaliveTimer: _k2, ...revSessInfo } = reverseInfo;
+    localStorage.setItem(_sessKey(timerKey), JSON.stringify(sessInfo));
+    localStorage.setItem(_sessKey(reverseTk), JSON.stringify(revSessInfo));
+  }
+
+  function _persistRib(routerId) {
+    const rib = _bgpRib.get(routerId) || [];
+    localStorage.setItem(_ribKey(routerId), JSON.stringify(rib));
+  }
+
+  function _clearPersistedSession(timerKey, reverseTk) {
+    localStorage.removeItem(_sessKey(timerKey));
+    if (reverseTk) localStorage.removeItem(_sessKey(reverseTk));
+  }
+
   // ---- ユーティリティ ----
 
   function _classfulMask(ip) {
@@ -86,11 +107,13 @@
       if (idx >= 0) rib[idx] = entry;
       else rib.push(entry);
     }
+    _persistRib(routerId);
   }
 
   function _clearRoutesFromNeighbor(routerId, neighborIp) {
     if (!_bgpRib.has(routerId)) return;
     _bgpRib.set(routerId, _bgpRib.get(routerId).filter(e => e.neighborIp !== neighborIp));
+    _persistRib(routerId);
   }
 
   function _withdrawRoutes(routerId, routes, neighborIp) {
@@ -99,6 +122,7 @@
     _bgpRib.set(routerId, _bgpRib.get(routerId).filter(
       e => !(keys.has(`${e.prefix}/${e.prefixLen}`) && e.neighborIp === neighborIp)
     ));
+    _persistRib(routerId);
   }
 
   // ---- セッション管理 ----
@@ -125,11 +149,13 @@
         _bgpEstablished.delete(otherTk);
         _bgpSessionInfo.delete(otherTk);
         _clearRoutesFromNeighbor(info.receiverRouterId, info.senderIp);
+        _clearPersistedSession(otherTk, null);
       }
     }
     _bgpEstablished.delete(tk);
     _bgpSessionInfo.delete(tk);
     _clearRoutesFromNeighbor(routerId, neighborIp);
+    _clearPersistedSession(tk, null);
   }
 
   // ---- BGP プロトコル ----
@@ -272,6 +298,9 @@
       clearTimeout(_bgpRetryTimers.get(timerKey));
       _bgpRetryTimers.delete(timerKey);
     }
+
+    // セッション情報を localStorage に永続化（リロード後に 3-way ハンドシェイクを再実行しないため）
+    _persistSession(timerKey, _bgpSessionInfo.get(timerKey), reverseTk, _bgpSessionInfo.get(reverseTk));
 
     // BGP UPDATE 交換（各 OS のパーサで network 文を取得）
     const sNetworks = sParser.getBgpNetworks(scfg);
@@ -463,14 +492,37 @@
     if (!parser) return;
     const dummyIo = { println: () => {} };
     const neighbors = parser.getNeighbors(cfg);
+
+    // RIB を localStorage から復元
+    const savedRib = localStorage.getItem(_ribKey(router.id));
+    if (savedRib) {
+      try { _bgpRib.set(router.id, JSON.parse(savedRib)); } catch (_) {}
+    }
+
     for (const { neighborIp, procKey } of neighbors) {
       const tk = router.id + ':' + neighborIp;
-      _bgpEstablished.delete(tk);
+
+      // 既存のタイマーをクリア
       if (_bgpSessionInfo.has(tk) && _bgpSessionInfo.get(tk).keepaliveTimer) {
         clearInterval(_bgpSessionInfo.get(tk).keepaliveTimer);
       }
-      _bgpSessionInfo.delete(tk);
       if (_bgpRetryTimers.has(tk)) { clearTimeout(_bgpRetryTimers.get(tk)); _bgpRetryTimers.delete(tk); }
+
+      // 保存済みセッションがある場合はハンドシェイクをスキップして直接 Established に
+      const savedSess = localStorage.getItem(_sessKey(tk));
+      if (savedSess) {
+        try {
+          const info = JSON.parse(savedSess);
+          _bgpEstablished.set(tk, true);
+          // keepaliveTimer は再起動しない（Hold Timer タイムアウトなし・pcap ノイズ回避）
+          _bgpSessionInfo.set(tk, { ...info, keepaliveTimer: null });
+          continue;
+        } catch (_) {}
+      }
+
+      // 保存済み状態なし → 通常の 3-way ハンドシェイクで接続
+      _bgpEstablished.delete(tk);
+      _bgpSessionInfo.delete(tk);
       setTimeout(() => _triggerBgpTcp(router, procKey, neighborIp, dummyIo), 500);
     }
   }
