@@ -527,7 +527,54 @@
     }
   }
 
-  // ---- 公開 API ----
+  // ---- 全状態クリア（reset all / ノード削除時） ----
+
+  function _clearAllBgpState() {
+    // タイマー停止
+    for (const info of _bgpSessionInfo.values()) {
+      if (info && info.keepaliveTimer) clearInterval(info.keepaliveTimer);
+    }
+    for (const tid of _bgpRetryTimers.values()) clearTimeout(tid);
+
+    // インメモリクリア
+    _bgpEstablished.clear();
+    _bgpSessionInfo.clear();
+    _bgpRetryTimers.clear();
+    _bgpRib.clear();
+
+    // localStorage クリア（bgp_sess:* / bgp_rib:*）
+    const toRemove = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && (k.startsWith('bgp_sess:') || k.startsWith('bgp_rib:'))) toRemove.push(k);
+    }
+    toRemove.forEach(k => localStorage.removeItem(k));
+  }
+
+  function _clearRouterBgpState(routerId) {
+    const prefix = routerId + ':';
+    // タイマー停止 & インメモリクリア（このルータに関連するエントリ）
+    for (const [tk, info] of _bgpSessionInfo) {
+      if (!tk.startsWith(prefix)) continue;
+      if (info && info.keepaliveTimer) clearInterval(info.keepaliveTimer);
+      _bgpEstablished.delete(tk);
+      _bgpSessionInfo.delete(tk);
+    }
+    for (const [tk, tid] of _bgpRetryTimers) {
+      if (tk.startsWith(prefix)) { clearTimeout(tid); _bgpRetryTimers.delete(tk); }
+    }
+    _bgpRib.delete(routerId);
+
+    // localStorage クリア
+    const toRemove = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && (k.startsWith('bgp_sess:' + prefix) || k === 'bgp_rib:' + routerId)) toRemove.push(k);
+    }
+    toRemove.forEach(k => localStorage.removeItem(k));
+  }
+
+
 
   global.RouterBgp = {
     registerOsParser(osName, parser) { _osParsers.set(osName, parser); },
@@ -543,7 +590,9 @@
     isEstablished(routerId, peerIp)  { return !!_bgpEstablished.get(routerId + ':' + peerIp); },
     getSessionInfo(routerId, peerIp) { return _bgpSessionInfo.get(routerId + ':' + peerIp); },
 
-    restoreSessions: _restoreSessions,
+    restoreSessions:   _restoreSessions,
+    clearAll:          _clearAllBgpState,
+    clearRouter:       _clearRouterBgpState,
 
     // 将来の show コマンド等向けにユーティリティを公開
     classfulMask: _classfulMask,

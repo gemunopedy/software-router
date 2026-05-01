@@ -91,6 +91,7 @@
       if (!tm.has(node.id)) tm.openRouter(node);
     },
     onNodeDeleted: (id) => {
+      if (window.RouterBgp) RouterBgp.clearRouter(id);
       Storage.removeRouter(id);
       if (tm.has(id)) tm.closeRouter(id);
       updateBadge();
@@ -420,6 +421,7 @@
     if (!confirm('トポロジーと全ルータの設定を初期状態に戻します。よろしいですか？')) return;
     // 既存タブを閉じる
     [...topology.nodes].forEach(n => { if (tm.has(n.id)) tm.closeRouter(n.id); });
+    if (window.RouterBgp) RouterBgp.clearAll();
     Storage.resetAll(editor.getTopology());
     Storage.clearTopology();
     topology = Storage.loadTopology(DEFAULT_TOPO);
