@@ -30,9 +30,14 @@
       out.src = ip4(pkt, 14 + 14);
       out.dst = ip4(pkt, 14 + 24);
       const sMac = [0,1,2,3,4,5].map(i => pkt[14 + 8 + i].toString(16).padStart(2,'0')).join(':');
-      out.info = op === 1 ? `Who has ${out.dst}?  Tell ${out.src}`
-               : op === 2 ? `${out.src} is at ${sMac}`
-               : `op=${op}`;
+      const isGarp = out.src === out.dst;
+      if (op === 1) {
+        out.info = isGarp ? `Gratuitous ARP for ${out.src} (Request)` : `Who has ${out.dst}?  Tell ${out.src}`;
+      } else if (op === 2) {
+        out.info = isGarp ? `Gratuitous ARP for ${out.src} (Reply)` : `${out.src} is at ${sMac}`;
+      } else {
+        out.info = `op=${op}`;
+      }
       return out;
     }
     if (et === 0x0800) {
