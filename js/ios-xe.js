@@ -82,6 +82,26 @@
     return mask.split('.').reduce((n, o) => n + (parseInt(o, 10).toString(2).match(/1/g) || []).length, 0);
   }
 
+  // prefix bits → dotted mask
+  function prefixToMask(bits) {
+    const n = parseInt(bits, 10);
+    if (n <= 0) return '0.0.0.0';
+    if (n >= 32) return '255.255.255.255';
+    const mask = 0xFFFFFFFF & (0xFFFFFFFF << (32 - n));
+    return [(mask >> 24) & 0xFF, (mask >> 16) & 0xFF, (mask >> 8) & 0xFF, mask & 0xFF].join('.');
+  }
+
+  // ip route 行を解析: [{prefix, mask, nexthop, ad}]
+  function getStaticRoutes(cfg) {
+    const result = [];
+    const re = /^ip route\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s+(\d+))?/gim;
+    let m;
+    while ((m = re.exec(cfg || ''))) {
+      result.push({ prefix: m[1], mask: m[2], nexthop: m[3], ad: m[4] ? parseInt(m[4]) : 1 });
+    }
+    return result;
+  }
+
   // 行中の hostname を取得
   function getHostname(cfg) {
     const m = cfg.match(/^hostname\s+(\S+)/im);
@@ -270,6 +290,9 @@
       const bgpRoutes = RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self');
       bgpRoutes.forEach(e => {
         io.println(`B     ${e.prefix}/${e.prefixLen} [20/0] via ${e.nextHop}, 00:00:00`);
+      });
+      getStaticRoutes(cfg).forEach(e => {
+        io.println(`S     ${e.prefix}/${maskToPrefix(e.mask)} [${e.ad}/0] via ${e.nexthop}`);
       });
       return;
     }
@@ -955,6 +978,34 @@
         const name = parts[2];
         if (!name) { io.println('% Incomplete command.'); return true; }
         _removeIface(router, name);
+        return true;
+      }
+
+      // ip route <prefix> <mask> <nexthop> [<ad>]
+      if (verb === 'ip' && _ex(parts[1], ['route','address']) === 'route') {
+        const prefix = parts[2], mask = parts[3], nexthop = parts[4];
+        if (!prefix || !mask || !nexthop) { io.println('% Incomplete command.'); return true; }
+        if (!/^\d+\.\d+\.\d+\.\d+$/.test(prefix) || !/^\d+\.\d+\.\d+\.\d+$/.test(mask)) {
+          io.println('% Invalid address format'); return true;
+        }
+        const ad = parts[5] && /^\d+$/.test(parts[5]) ? ` ${parts[5]}` : '';
+        const cfg = Storage.read(router.id, 'running') || '';
+        // 同一プレフィックス+マスクの既存行を置換
+        const re = new RegExp(`^ip route\\s+${prefix.replace(/\./g,'\\.')}\\s+${mask.replace(/\./g,'\\.')}\\s+\\S+.*$`, 'im');
+        const newLine = `ip route ${prefix} ${mask} ${nexthop}${ad}`;
+        const updated = re.test(cfg) ? cfg.replace(re, newLine) : cfg.trimEnd() + '\n' + newLine + '\n';
+        Storage.write(router.id, 'running', updated);
+        return true;
+      }
+
+      // no ip route <prefix> <mask> [<nexthop>]
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'ip' &&
+          _ex(parts[2], ['route']) === 'route') {
+        const prefix = parts[3], mask = parts[4];
+        if (!prefix || !mask) { io.println('% Incomplete command.'); return true; }
+        const cfg = Storage.read(router.id, 'running') || '';
+        const re = new RegExp(`^ip route\\s+${prefix.replace(/\./g,'\\.')}\\s+${mask.replace(/\./g,'\\.')}.*\\n?`, 'im');
+        Storage.write(router.id, 'running', cfg.replace(re, ''));
         return true;
       }
 

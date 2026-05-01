@@ -90,6 +90,70 @@
     return m ? m[1] : null;
   }
 
+  // router static ブロック内の静的ルートを解析: [{prefix, prefixLen, nexthop, ad}]
+  function getStaticRoutes(cfg) {
+    const result = [];
+    const lines = (cfg || '').split('\n');
+    let inStatic = false;
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (/^router\s+static\s*$/i.test(t)) { inStatic = true; continue; }
+      if (inStatic) {
+        if (t !== '' && !/^[ \t]/.test(t)) { inStatic = false; continue; }
+        if (/address-family/i.test(t.trim())) continue;
+        const m = t.trim().match(/^([\d.]+)\/([\d]+)\s+([\d.]+)(?:\s+(\d+))?$/);
+        if (m) result.push({ prefix: m[1], prefixLen: parseInt(m[2]), nexthop: m[3], ad: m[4] ? parseInt(m[4]) : 1 });
+      }
+    }
+    return result;
+  }
+
+  // router static ブロックに行を追加/置換
+  function _updateStaticLine(router, prefix, prefixLen, nexthop, ad) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const entry = ad !== 1 ? `${prefix}/${prefixLen} ${nexthop} ${ad}` : `${prefix}/${prefixLen} ${nexthop}`;
+    const matchRe = new RegExp(`^${prefix.replace(/\./g,'\\.')}\\/${prefixLen}\\s+`);
+    if (!/^router\s+static\s*$/im.test(cfg)) {
+      Storage.write(router.id, 'running', cfg.trimEnd() + `\nrouter static\n  address-family ipv4 unicast\n   ${entry}\n`);
+      return;
+    }
+    const lines = cfg.split('\n');
+    let inStatic = false, inserted = false;
+    const out = [];
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (/^router\s+static\s*$/i.test(t)) { inStatic = true; out.push(t); continue; }
+      if (inStatic) {
+        if (t !== '' && !/^[ \t]/.test(t)) {
+          if (!inserted) { out.push(`   ${entry}`); inserted = true; }
+          inStatic = false;
+        } else if (matchRe.test(t.trim())) {
+          out.push(`   ${entry}`); inserted = true; continue;
+        }
+      }
+      out.push(t);
+    }
+    if (!inserted) out.push(`   ${entry}`);
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  // router static ブロックから行を削除
+  function _removeStaticLine(router, prefix, prefixLen) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const matchRe = new RegExp(`^${prefix.replace(/\./g,'\\.')}\\/${prefixLen}\\s+`);
+    let inStatic = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (/^router\s+static\s*$/i.test(t)) { inStatic = true; return true; }
+      if (inStatic) {
+        if (t !== '' && !/^[ \t]/.test(t)) { inStatic = false; return true; }
+        if (matchRe.test(t.trim())) return false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
   function topoIdx(routerId) {
     const topo = global.TOPOLOGY;
     if (!topo || !topo.nodes) return 1;
@@ -393,6 +457,9 @@
     bgpRoutes.forEach(e => {
       io.println(`B     ${e.prefix}/${e.prefixLen} [20/0] via ${e.nextHop}`);
     });
+    getStaticRoutes(cfg).forEach(e => {
+      io.println(`S     ${e.prefix}/${e.prefixLen} [${e.ad}/0] via ${e.nexthop}`);
+    });
   };
 
   showHandlers['arp'] = (args, router, io) => {
@@ -424,11 +491,13 @@
   const _CCANDS = ['do','end','exit','hostname','interface','ip','no','router'];
   const _ICANDS = ['description','do','end','exit','ipv4','no','shutdown'];
   const _BCANDS = ['bgp','do','end','exit','neighbor','network','no','router-id'];
+  const _SCANDS = ['address-family','do','end','exit','no'];
 
   function handleCommand(parts, state, io) {
     const router = state.router;
     const _vcands = state.configMode === 'if' ? _ICANDS
                   : state.configMode === 'router' ? _BCANDS
+                  : state.configMode === 'static' ? _SCANDS
                   : state.configMode ? _CCANDS
                   : _ECANDS;
     const verb = _ex(parts[0], _vcands);
@@ -439,11 +508,35 @@
         return true;
       }
       if (verb === 'exit') {
-        if (state.configMode === 'if' || state.configMode === 'router') {
+        if (state.configMode === 'if' || state.configMode === 'router' || state.configMode === 'static') {
           state.configMode = 'global'; state.configIface = null; state.configRouter = null;
         } else {
           state.configMode = null;
         }
+        return true;
+      }
+
+      // ---------- config-static モード ----------
+      if (state.configMode === 'static') {
+        // address-family ipv4 unicast はパススルー（モード変更なし）
+        if (verb === 'address-family') return true;
+        // no <prefix/len> [<nexthop>] → 削除
+        if (verb === 'no') {
+          const cidr = parts[1];
+          if (!cidr || !cidr.includes('/')) { io.println('% Incomplete: <prefix/len> required'); return true; }
+          const [prefix, lenStr] = cidr.split('/');
+          _removeStaticLine(router, prefix, parseInt(lenStr, 10));
+          return true;
+        }
+        // <prefix/len> <nexthop> [<ad>]
+        const cidr = parts[0], nexthop = parts[1];
+        if (cidr && cidr.includes('/') && nexthop && /^\d+\.\d+\.\d+\.\d+$/.test(nexthop)) {
+          const [prefix, lenStr] = cidr.split('/');
+          const ad = parts[2] && /^\d+$/.test(parts[2]) ? parseInt(parts[2]) : 1;
+          _updateStaticLine(router, prefix, parseInt(lenStr, 10), nexthop, ad);
+          return true;
+        }
+        io.println(`% Invalid input in config-static: ${parts.join(' ')}`);
         return true;
       }
 
@@ -594,6 +687,16 @@
         }
         state.configMode = 'router';
         state.configRouter = procKey;
+        return true;
+      }
+
+      // router static
+      if (verb === 'router' && _ex(parts[1], ['bgp','static']) === 'static') {
+        const cfg = Storage.read(router.id, 'running') || '';
+        if (!/^router\s+static\s*$/im.test(cfg)) {
+          Storage.write(router.id, 'running', cfg.trimEnd() + '\nrouter static\n  address-family ipv4 unicast\n');
+        }
+        state.configMode = 'static';
         return true;
       }
 

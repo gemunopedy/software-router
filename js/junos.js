@@ -96,6 +96,17 @@
     return m ? parseInt(m[1], 10) : 65000;
   }
 
+  // set routing-options static route <prefix/len> next-hop <nexthop> [preference <ad>]
+  function getStaticRoutes(cfg) {
+    const result = [];
+    const re = /^set routing-options static route ([\d.]+)\/([\d]+) next-hop ([\d.]+)(?:\s+preference\s+(\d+))?/gim;
+    let m;
+    while ((m = re.exec(cfg || ''))) {
+      result.push({ prefix: m[1], prefixLen: parseInt(m[2], 10), nexthop: m[3], ad: m[4] ? parseInt(m[4]) : 1 });
+    }
+    return result;
+  }
+
   function getBgpRouterId(cfg) {
     const ridM = (cfg || '').match(/^set routing-options router-id\s+([\d.]+)/im);
     if (ridM) return ridM[1];
@@ -235,6 +246,10 @@
       io.println(`${e.prefix}/${e.prefixLen}     *[BGP/${e.asPath.join(' ')}]`);
       io.println(`                    > to ${e.nextHop}`);
     });
+    getStaticRoutes(cfg).forEach(e => {
+      io.println(`${e.prefix}/${e.prefixLen}       *[Static/${e.ad}] preference ${e.ad}`);
+      io.println(`                    > to ${e.nexthop}`);
+    });
   }
 
   function showConfig(router, io) {
@@ -267,11 +282,20 @@
     }
     const asn = getBgpAs(cfg);
     const rid = getBgpRouterId(cfg);
+    const staticRoutes = getStaticRoutes(cfg);
     const roM = cfg.match(/^set routing-options/gim);
-    if (roM) {
+    if (roM || staticRoutes.length) {
       io.println('routing-options {');
       if (asn) io.println(`    autonomous-system ${asn};`);
       if (rid) io.println(`    router-id ${rid};`);
+      if (staticRoutes.length) {
+        io.println('    static {');
+        staticRoutes.forEach(e => {
+          const pref = e.ad !== 1 ? ` preference ${e.ad}` : '';
+          io.println(`        route ${e.prefix}/${e.prefixLen} next-hop ${e.nexthop};${pref}`);
+        });
+        io.println('    }');
+      }
       io.println('}');
     }
     const neighbors = getBgpNeighbors(cfg);
@@ -349,6 +373,19 @@
       if (key === 'router-id' && rest[1]) {
         _deleteLines(router, /^set routing-options router-id\s+/i);
         _setLine(router, `set routing-options router-id ${rest[1]}`);
+        return true;
+      }
+      // set routing-options static route <prefix/len> next-hop <nexthop> [preference <ad>]
+      if (key === 'static' && (rest[1] || '').toLowerCase() === 'route') {
+        const cidr = rest[2];
+        if (!cidr || !cidr.includes('/')) { io.println('% Usage: set routing-options static route <prefix/len> next-hop <nexthop>'); return true; }
+        const nhIdx = rest.findIndex(w => w.toLowerCase() === 'next-hop');
+        if (nhIdx < 0 || !rest[nhIdx + 1]) { io.println('% next-hop required'); return true; }
+        const nexthop = rest[nhIdx + 1];
+        const prefIdx = rest.findIndex(w => w.toLowerCase() === 'preference');
+        const ad = prefIdx >= 0 && rest[prefIdx + 1] ? ` preference ${rest[prefIdx + 1]}` : '';
+        _deleteLines(router, new RegExp(`^set routing-options static route ${cidr.replace(/\./g,'\\.').replace('/','\/')} next-hop\\s+`, 'i'));
+        _setLine(router, `set routing-options static route ${cidr} next-hop ${nexthop}${ad}`);
         return true;
       }
     }
@@ -461,6 +498,11 @@
       const key = (rest[0] || '').toLowerCase();
       if (key === 'autonomous-system') { _deleteLines(router, /^set routing-options autonomous-system\s+/i); return true; }
       if (key === 'router-id') { _deleteLines(router, /^set routing-options router-id\s+/i); return true; }
+      if (key === 'static' && (rest[1] || '').toLowerCase() === 'route' && rest[2]) {
+        const cidr = rest[2];
+        _deleteLines(router, new RegExp(`^set routing-options static route ${cidr.replace(/\./g,'\\.').replace('/','\/')}\\s+`, 'i'));
+        return true;
+      }
     }
 
     io.println(`% Unknown delete path: ${parts.slice(1).join(' ')}`);
