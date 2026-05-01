@@ -578,7 +578,7 @@
   }
 
   // 確立済みネイバーへ BGP UPDATE を送信し、ネイバーの RIB に登録する
-  function _advertiseNetworkToNeighbors(router, prefix, mask) {
+  function _advertiseNetworkToNeighbors(router, prefix, mask, io) {
     const prefixLen = maskToPrefix(mask || _classfulMask(prefix));
     const nlri = [{ prefix, prefixLen }];
     const cfg = Storage.read(router.id, 'running') || '';
@@ -600,6 +600,7 @@
       Pcap.append(info.receiverRouterId, updatePkt);
       if (Capture) Capture.emit(info.receiverRouterId, updatePkt, { iface: info.receiverIface });
       _installBgpRoutes(info.receiverRouterId, nlri, info.senderIp, [localAs], info.senderIp);
+      if (io) io.println(`%BGP-5-UPDATE: Sending UPDATE to ${info.receiverIp}: ${prefix}/${prefixLen}`);
     }
     if (global.AppRefreshPcapStatus) global.AppRefreshPcapStatus();
   }
@@ -1305,7 +1306,7 @@
           const line = mask ? `network ${prefix} mask ${mask}` : `network ${prefix}`;
           _updateRouterLine(router, procKey, new RegExp(`^network\\s+${prefix.replace(/\./g,'\\.')}\\s*`,'i'), line);
           _installBgpRoutes(router.id, [{ prefix, prefixLen: maskToPrefix(effectiveMask) }], '0.0.0.0', [], 'self');
-          _advertiseNetworkToNeighbors(router, prefix, effectiveMask);
+          _advertiseNetworkToNeighbors(router, prefix, effectiveMask, io);
           return true;
         }
 
