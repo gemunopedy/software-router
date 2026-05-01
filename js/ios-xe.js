@@ -257,6 +257,10 @@
         io.println(`C     ${net}/${prefix} is directly connected, ${iface.name}`);
         io.println(`L     ${ipInfo.ip}/32 is directly connected, ${iface.name}`);
       });
+      const bgpRoutes = (_bgpRib.get(router.id) || []).filter(e => e.selected && e.neighborIp !== 'self');
+      bgpRoutes.forEach(e => {
+        io.println(`B     ${e.prefix}/${e.prefixLen} [20/0] via ${e.nextHop}, 00:00:00`);
+      });
       return;
     }
 
@@ -470,6 +474,8 @@
   const _bgpEstablished = new Map();
   // BGP セッション情報: 'routerId:neighborIp' -> { establishedAt: ms, keepaliveTimer: timerId }
   const _bgpSessionInfo = new Map();
+  // BGP RIB: 'routerId' -> [{prefix, prefixLen, nextHop, asPath, origin, neighborIp, selected}]
+  const _bgpRib = new Map();
 
   // リトライをスケジュール（共通ヘルパー）
   function _scheduleRetry(timerKey, router, procKey, neighborIp, io) {
@@ -498,7 +504,131 @@
     return '0.0.0.0';
   }
 
-  // 受信側ルータが BGP SYN (port 179) を受け取った際の応答処理。
+  // クラスフルデフォルトマスク
+  function _classfulMask(ip) {
+    const first = parseInt((ip || '0').split('.')[0], 10);
+    if (first < 128) return '255.0.0.0';
+    if (first < 192) return '255.255.0.0';
+    return '255.255.255.0';
+  }
+
+  // router bgp ブロックから network 文を収集
+  function _getBgpNetworks(cfg) {
+    const lines = (cfg || '').split('\n');
+    const hi = lines.findIndex(l => /^router\s+bgp\s+\d+\s*$/i.test(l.trimEnd()));
+    if (hi < 0) return [];
+    const result = [];
+    for (let i = hi + 1; i < lines.length; i++) {
+      const l = lines[i];
+      if (l !== '' && !/^[ \t]/.test(l)) break;
+      const m = l.trim().match(/^network\s+([\d.]+)(?:\s+mask\s+([\d.]+))?$/i);
+      if (!m) continue;
+      const prefix = m[1], mask = m[2] || _classfulMask(m[1]);
+      result.push({ prefix, mask, prefixLen: maskToPrefix(mask) });
+    }
+    return result;
+  }
+
+  // BGP RIB にルートを upsert 登録（neighborIp='self' のとき自局 originate）
+  function _installBgpRoutes(routerId, routes, nextHop, asPath, neighborIp) {
+    if (!_bgpRib.has(routerId)) _bgpRib.set(routerId, []);
+    const rib = _bgpRib.get(routerId);
+    const src = neighborIp || nextHop;
+    for (const r of routes) {
+      const key = `${r.prefix}/${r.prefixLen}`;
+      const idx = rib.findIndex(e => `${e.prefix}/${e.prefixLen}` === key && e.neighborIp === src);
+      const entry = { prefix: r.prefix, prefixLen: r.prefixLen, nextHop, asPath: [...asPath], origin: 'i', neighborIp: src, selected: true };
+      if (idx >= 0) rib[idx] = entry;
+      else rib.push(entry);
+    }
+  }
+
+  // 指定ネイバーから学習したルートを RIB から全削除
+  function _clearBgpRoutesFromNeighbor(routerId, neighborIp) {
+    if (!_bgpRib.has(routerId)) return;
+    _bgpRib.set(routerId, _bgpRib.get(routerId).filter(e => e.neighborIp !== neighborIp));
+  }
+
+  // 指定ネイバーから学習した特定ルートのみ RIB から削除
+  function _withdrawRoutesFromNeighbor(routerId, routes, neighborIp) {
+    if (!_bgpRib.has(routerId)) return;
+    const keys = new Set(routes.map(r => `${r.prefix}/${r.prefixLen}`));
+    _bgpRib.set(routerId, _bgpRib.get(routerId).filter(e => !(keys.has(`${e.prefix}/${e.prefixLen}`) && e.neighborIp === neighborIp)));
+  }
+
+  // BGP セッションを完全に切断し RIB も清掃する
+  function _teardownBgpSession(routerId, neighborIp) {
+    const tk = routerId + ':' + neighborIp;
+    if (_bgpRetryTimers.has(tk)) { clearTimeout(_bgpRetryTimers.get(tk)); _bgpRetryTimers.delete(tk); }
+    const info = _bgpSessionInfo.get(tk);
+    if (info) {
+      if (info.keepaliveTimer) clearInterval(info.keepaliveTimer);
+      const otherTk = info.receiverRouterId + ':' + info.senderIp;
+      if (otherTk !== tk && _bgpSessionInfo.has(otherTk)) {
+        const otherInfo = _bgpSessionInfo.get(otherTk);
+        if (otherInfo && otherInfo.keepaliveTimer) clearInterval(otherInfo.keepaliveTimer);
+        _bgpEstablished.delete(otherTk);
+        _bgpSessionInfo.delete(otherTk);
+        _clearBgpRoutesFromNeighbor(info.receiverRouterId, info.senderIp);
+      }
+    }
+    _bgpEstablished.delete(tk);
+    _bgpSessionInfo.delete(tk);
+    _clearBgpRoutesFromNeighbor(routerId, neighborIp);
+  }
+
+  // 確立済みネイバーへ BGP UPDATE を送信し、ネイバーの RIB に登録する
+  function _advertiseNetworkToNeighbors(router, prefix, mask) {
+    const prefixLen = maskToPrefix(mask || _classfulMask(prefix));
+    const nlri = [{ prefix, prefixLen }];
+    const cfg = Storage.read(router.id, 'running') || '';
+    const localAs = _getBgpAs(cfg);
+    const Pcap = global.RouterPcap;
+    for (const [tk, est] of _bgpEstablished) {
+      if (!est || !tk.startsWith(router.id + ':')) continue;
+      const info = _bgpSessionInfo.get(tk);
+      if (!info) continue;
+      const updatePkt = Packets.buildPacket({
+        proto: 'bgp', bgpType: 'update',
+        src: info.senderIp, dst: info.receiverIp,
+        srcMac: info.senderMac, dstMac: info.receiverMac,
+        sport: info.senderSport, dport: 179,
+        nlri, nextHop: info.senderIp, asPath: [localAs], origin: 0,
+      });
+      Pcap.append(info.senderRouterId, updatePkt);
+      if (Capture) Capture.emit(info.senderRouterId, updatePkt, { iface: info.senderIface });
+      Pcap.append(info.receiverRouterId, updatePkt);
+      if (Capture) Capture.emit(info.receiverRouterId, updatePkt, { iface: info.receiverIface });
+      _installBgpRoutes(info.receiverRouterId, nlri, info.senderIp, [localAs], info.senderIp);
+    }
+    if (global.AppRefreshPcapStatus) global.AppRefreshPcapStatus();
+  }
+
+  // 確立済みネイバーへ BGP WITHDRAW を送信し、ネイバーの RIB から削除する
+  function _withdrawNetworkFromNeighbors(router, prefix, mask) {
+    const prefixLen = maskToPrefix(mask || _classfulMask(prefix));
+    const withdrawn = [{ prefix, prefixLen }];
+    const Pcap = global.RouterPcap;
+    for (const [tk, est] of _bgpEstablished) {
+      if (!est || !tk.startsWith(router.id + ':')) continue;
+      const info = _bgpSessionInfo.get(tk);
+      if (!info) continue;
+      const withdrawPkt = Packets.buildPacket({
+        proto: 'bgp', bgpType: 'update',
+        src: info.senderIp, dst: info.receiverIp,
+        srcMac: info.senderMac, dstMac: info.receiverMac,
+        sport: info.senderSport, dport: 179,
+        withdrawn, nlri: [],
+      });
+      Pcap.append(info.senderRouterId, withdrawPkt);
+      if (Capture) Capture.emit(info.senderRouterId, withdrawPkt, { iface: info.senderIface });
+      Pcap.append(info.receiverRouterId, withdrawPkt);
+      if (Capture) Capture.emit(info.receiverRouterId, withdrawPkt, { iface: info.receiverIface });
+      _withdrawRoutesFromNeighbor(info.receiverRouterId, withdrawn, info.senderIp);
+    }
+    _withdrawRoutesFromNeighbor(router.id, withdrawn, 'self');
+    if (global.AppRefreshPcapStatus) global.AppRefreshPcapStatus();
+  }
   // 受信側は自分自身の running-config に neighbor 設定があれば SYN-ACK を送信、なければ RST,ACK。
   function _onBgpSynReceived({
     receiverRouterId, receiverIface, receiverMac, receiverIp,
@@ -628,11 +758,54 @@
       });
       emit2(ka, senderRouterId, senderIface, receiverRouterId, receiverIface);
     }, interval);
-    _bgpSessionInfo.set(timerKey, { establishedAt: Date.now(), keepaliveTimer });
+    // セッション情報を両方向分保存（UPDATE 再広報に使用）
+    _bgpSessionInfo.set(timerKey, {
+      establishedAt: Date.now(), keepaliveTimer,
+      senderRouterId, senderIface, senderMac, senderIp, senderSport,
+      receiverRouterId, receiverIface, receiverMac, receiverIp,
+      senderAs, receiverAs: rAs,
+    });
+    const reverseTk = receiverRouterId + ':' + senderIp;
+    _bgpEstablished.set(reverseTk, true);
+    _bgpSessionInfo.set(reverseTk, {
+      establishedAt: Date.now(), keepaliveTimer: null,
+      senderRouterId: receiverRouterId, senderIface: receiverIface, senderMac: receiverMac, senderIp: receiverIp, senderSport: BGP_PORT,
+      receiverRouterId: senderRouterId, receiverIface: senderIface, receiverMac: senderMac, receiverIp: senderIp,
+      senderAs: rAs, receiverAs: sAs,
+    });
     if (_bgpRetryTimers.has(timerKey)) {
       clearTimeout(_bgpRetryTimers.get(timerKey));
       _bgpRetryTimers.delete(timerKey);
     }
+
+    // BGP UPDATE 交換: 各ルータの network 文を相手に広報する
+    const sNetworks = _getBgpNetworks(scfg);
+    const rNetworks = _getBgpNetworks(rcfg);
+    if (sNetworks.length > 0) {
+      const updS = Packets.buildPacket({
+        proto: 'bgp', bgpType: 'update',
+        src: senderIp, dst: receiverIp, srcMac: senderMac, dstMac: receiverMac,
+        sport: senderSport, dport: BGP_PORT,
+        nlri: sNetworks.map(n => ({ prefix: n.prefix, prefixLen: n.prefixLen })),
+        nextHop: senderIp, asPath: [sAs], origin: 0,
+      });
+      emit2(updS, senderRouterId, senderIface, receiverRouterId, receiverIface);
+      _installBgpRoutes(receiverRouterId, sNetworks, senderIp, [sAs], senderIp);
+      _installBgpRoutes(senderRouterId, sNetworks, '0.0.0.0', [], 'self');
+    }
+    if (rNetworks.length > 0) {
+      const updR = Packets.buildPacket({
+        proto: 'bgp', bgpType: 'update',
+        src: receiverIp, dst: senderIp, srcMac: receiverMac, dstMac: senderMac,
+        sport: BGP_PORT, dport: senderSport,
+        nlri: rNetworks.map(n => ({ prefix: n.prefix, prefixLen: n.prefixLen })),
+        nextHop: receiverIp, asPath: [rAs], origin: 0,
+      });
+      emit2(updR, senderRouterId, senderIface, receiverRouterId, receiverIface);
+      _installBgpRoutes(senderRouterId, rNetworks, receiverIp, [rAs], receiverIp);
+      _installBgpRoutes(receiverRouterId, rNetworks, '0.0.0.0', [], 'self');
+    }
+
     if (global.AppRefreshPcapStatus) global.AppRefreshPcapStatus();
   }
 
@@ -962,7 +1135,8 @@
           updown = d > 0
             ? `${d}d${String(h).padStart(2,'0')}h    `
             : `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-          statePfx = '0';
+          const pfxCount = (_bgpRib.get(router.id) || []).filter(e => e.neighborIp === n.ip).length;
+          statePfx = String(pfxCount);
         }
         io.println(`${ip} 4 ${as}       0       0      0    0    0 ${updown}  ${statePfx}`);
       });
@@ -971,9 +1145,24 @@
     }
 
     io.println(`BGP table version is 1, local router ID ${routerId}`);
-    io.println('Status codes: s suppressed, d damped, h history, * valid, > best, i - internal');
+    io.println('Status codes: s suppressed, d damped, h history, * valid, > best, i - internal,');
+    io.println('Origin codes: i - IGP, e - EGP, ? - incomplete');
     io.println('');
-    io.println('(no BGP entries - emulated)');
+    io.println('   Network          Next Hop        Metric LocPrf Weight Path');
+    const rib = _bgpRib.get(router.id) || [];
+    if (rib.length === 0) {
+      io.println('% No BGP network entries');
+      return;
+    }
+    rib.forEach(e => {
+      const isSelf = e.neighborIp === 'self';
+      const net = `${e.prefix}/${e.prefixLen}`.padEnd(17);
+      const nh = (isSelf ? '0.0.0.0' : e.nextHop).padEnd(15);
+      const weight = isSelf ? '32768' : '0';
+      const lPrf = isSelf ? String(32768).padStart(6) : '      ';
+      const path = e.asPath.join(' ');
+      io.println(`*>  ${net} ${nh}          0 ${lPrf} ${weight.padStart(6)} ${path} ${e.origin}`);
+    });
   }
 
   // ------- メインディスパッチャ -------
@@ -1067,16 +1256,8 @@
           if (key2 === 'remote-as') {
             if (!val) { io.println('% Incomplete command.'); return true; }
             _updateRouterLine(router, procKey, new RegExp(`^neighbor\\s+${nIp}\\s+remote-as\\s+`,'i'), `neighbor ${nIp} remote-as ${val}`);
-            // TCP 3-way handshake (BGP port 179) を自動実行
-            // 以前の確立済みフラグ・リトライタイマーをリセットして再試行
-            const tk = router.id + ':' + nIp;
-            _bgpEstablished.delete(tk);
-            // セッション切断時はKEEPALIVEタイマーも解除
-            if (_bgpSessionInfo.has(tk) && _bgpSessionInfo.get(tk).keepaliveTimer) {
-              clearInterval(_bgpSessionInfo.get(tk).keepaliveTimer);
-            }
-            _bgpSessionInfo.delete(tk);
-            if (_bgpRetryTimers.has(tk)) { clearTimeout(_bgpRetryTimers.get(tk)); _bgpRetryTimers.delete(tk); }
+            // 既存セッションを切断して再接続
+            _teardownBgpSession(router.id, nIp);
             _triggerBgpTcp(router, procKey, nIp, io);
           } else if (key2 === 'description') {
             const desc = parts.slice(3).join(' ');
@@ -1097,8 +1278,9 @@
           const nIp = parts[2], key2 = (parts[3] || '').toLowerCase();
           if (!nIp) { io.println('% Incomplete command.'); return true; }
           if (!key2 || key2 === 'remote-as') {
-            // remote-as なしで no neighbor → ネイバー全行削除
+            // remote-as なしで no neighbor → ネイバー全行削除＋セッション切断
             _removeRouterLines(router, procKey, new RegExp(`^neighbor\\s+${nIp}\\s+`,'i'));
+            _teardownBgpSession(router.id, nIp);
           } else {
             _removeRouterLine(router, procKey, new RegExp(`^neighbor\\s+${nIp}\\s+${key2}\\s*`,'i'));
           }
@@ -1119,8 +1301,11 @@
           if (!prefix) { io.println('% Incomplete command.'); return true; }
           const maskIdx = parts.findIndex(p => p.toLowerCase() === 'mask');
           const mask = maskIdx >= 0 ? parts[maskIdx + 1] : null;
+          const effectiveMask = mask || _classfulMask(prefix);
           const line = mask ? `network ${prefix} mask ${mask}` : `network ${prefix}`;
-          _updateRouterLine(router, procKey, new RegExp(`^network\\s+${prefix}\\s*`,'i'), line);
+          _updateRouterLine(router, procKey, new RegExp(`^network\\s+${prefix.replace(/\./g,'\\.')}\\s*`,'i'), line);
+          _installBgpRoutes(router.id, [{ prefix, prefixLen: maskToPrefix(effectiveMask) }], '0.0.0.0', [], 'self');
+          _advertiseNetworkToNeighbors(router, prefix, effectiveMask);
           return true;
         }
 
@@ -1128,7 +1313,12 @@
         if (verb === 'no' && (parts[1] || '').toLowerCase() === 'network') {
           const prefix = parts[2];
           if (!prefix) { io.println('% Incomplete command.'); return true; }
-          _removeRouterLine(router, procKey, new RegExp(`^network\\s+${prefix}\\s*`,'i'));
+          // 削除前にマスクを取得してから config から除去
+          const curCfg = Storage.read(router.id, 'running') || '';
+          const netM = curCfg.match(new RegExp(`^\\s*network\\s+${prefix.replace(/\./g,'\\.')}(?:\\s+mask\\s+([\\d.]+))?`, 'im'));
+          const mask = netM && netM[1] ? netM[1] : _classfulMask(prefix);
+          _removeRouterLine(router, procKey, new RegExp(`^network\\s+${prefix.replace(/\./g,'\\.')}\\s*`,'i'));
+          _withdrawNetworkFromNeighbors(router, prefix, mask);
           return true;
         }
 

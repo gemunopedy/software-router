@@ -152,6 +152,47 @@
     return buildBGPHeader(1, body);
   }
   function buildBGPKeepalive() { return buildBGPHeader(4, new Uint8Array(0)); }
+  function buildBGPUpdate(spec) {
+    const wList = spec.withdrawn || [];
+    const wParts = wList.map(r => {
+      const oct = Math.ceil(r.prefixLen / 8);
+      const b = new Uint8Array(1 + oct);
+      b[0] = r.prefixLen;
+      const ib = ipToBytes(r.prefix);
+      for (let i = 0; i < oct; i++) b[1 + i] = ib[i];
+      return b;
+    });
+    const wBytes = concat(wParts);
+    const wLen = new Uint8Array(2); w16(wLen, 0, wBytes.length);
+
+    const nlriList = spec.nlri || [];
+    const paParts = [];
+    if (nlriList.length > 0) {
+      paParts.push(Uint8Array.from([0x40, 1, 1, (spec.origin != null ? spec.origin : 0) & 0xff]));
+      const asPath = spec.asPath || [];
+      if (asPath.length > 0) {
+        const seg = new Uint8Array(2 + asPath.length * 2);
+        seg[0] = 2; seg[1] = asPath.length;
+        asPath.forEach((as, i) => w16(seg, 2 + i * 2, as & 0xffff));
+        paParts.push(concat([Uint8Array.from([0x40, 2, seg.length]), seg]));
+      } else {
+        paParts.push(Uint8Array.from([0x40, 2, 0]));
+      }
+      paParts.push(concat([Uint8Array.from([0x40, 3, 4]), ipToBytes(spec.nextHop || '0.0.0.0')]));
+    }
+    const paBytes = concat(paParts);
+    const paLen = new Uint8Array(2); w16(paLen, 0, paBytes.length);
+
+    const nParts = nlriList.map(r => {
+      const oct = Math.ceil(r.prefixLen / 8);
+      const b = new Uint8Array(1 + oct);
+      b[0] = r.prefixLen;
+      const ib = ipToBytes(r.prefix);
+      for (let i = 0; i < oct; i++) b[1 + i] = ib[i];
+      return b;
+    });
+    return buildBGPHeader(2, concat([wLen, wBytes, paLen, paBytes, ...nParts]));
+  }
   function buildBGPNotification(code, sub) {
     return buildBGPHeader(3, Uint8Array.from([code & 0xff, sub & 0xff]));
   }
@@ -244,6 +285,7 @@
         const t = (spec.bgpType || 'keepalive').toLowerCase();
         if (t === 'open') body = buildBGPOpen(spec.as || 65000, spec.hold || 180, spec.bgpId || spec.src);
         else if (t === 'notification') body = buildBGPNotification(spec.code || 6, spec.subcode || 0);
+        else if (t === 'update') body = buildBGPUpdate(spec);
         else body = buildBGPKeepalive();
         const tcp = buildTCP(spec.src, spec.dst, spec.sport || 50000, spec.dport || 179,
           0x18, body, spec.seq || 1, spec.ack || 1);
