@@ -245,6 +245,9 @@
     getStaticRoutes(cfg).forEach(e => {
       candidates.push({ type: 'Static', prefix: e.prefix, prefixLen: e.prefixLen, ad: e.ad, metric: 0, nexthop: e.nexthop });
     });
+    RouterIsis.getRib(router.id).forEach(e => {
+      candidates.push({ type: 'ISIS', prefix: e.prefix, prefixLen: e.prefixLen, ad: 15, metric: e.metric, nexthop: e.nexthop, level: e.level });
+    });
     RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self').forEach(e => {
       candidates.push({ type: 'BGP', prefix: e.prefix, prefixLen: e.prefixLen, ad: 20, metric: 0, nexthop: e.nextHop, asPath: e.asPath });
     });
@@ -259,6 +262,9 @@
         io.println(`                      Local via ${r.via}`);
       } else if (r.type === 'Static') {
         io.println(`${r.prefix}/${r.prefixLen}       *[Static/${r.ad}] preference ${r.ad}`);
+        io.println(`                    > to ${r.nexthop}`);
+      } else if (r.type === 'ISIS') {
+        io.println(`${r.prefix}/${r.prefixLen}       *[IS-IS/15] preference 15 metric ${r.metric}`);
         io.println(`                    > to ${r.nexthop}`);
       } else if (r.type === 'BGP') {
         const path = r.asPath ? r.asPath.join(' ') : '';
@@ -457,6 +463,25 @@
           return true;
         }
       }
+      if (proto === 'isis') {
+        const isisRest = rest.slice(1);
+        if ((isisRest[0] || '').toLowerCase() === 'interface') {
+          const ifname = isisRest[1];
+          if (!ifname) { io.println('% Incomplete: interface name required'); return true; }
+          const isisKey = isisRest.slice(2).join(' ');
+          if (isisKey) {
+            _deleteLines(router, new RegExp(`^set protocols isis interface ${ifname.replace(/\//g,'\\/')}\\s*$`, 'i'));
+            _setLine(router, `set protocols isis interface ${ifname} ${isisKey}`);
+          } else {
+            if (_setLineMissing(router, `set protocols isis interface ${ifname}`)) {
+              _setLine(router, `set protocols isis interface ${ifname}`);
+            }
+          }
+          RouterIsis.recalculate(router.id);
+          return true;
+        }
+        return true;
+      }
     }
 
     io.println(`% Unknown set path: ${parts.slice(1).join(' ')}`);
@@ -508,6 +533,21 @@
           return true;
         }
       }
+      if (proto === 'isis') {
+        const isisRest = rest.slice(1);
+        if ((isisRest[0] || '').toLowerCase() === 'interface') {
+          if (isisRest[1]) {
+            const ifname = isisRest[1];
+            _deleteLines(router, new RegExp(`^set protocols isis interface ${ifname.replace(/\//g,'\\/')}(\\s+.*)?$`, 'i'));
+          } else {
+            _deleteLines(router, /^set protocols isis interface\s+/i);
+          }
+        } else {
+          _deleteLines(router, /^set protocols isis\s+/i);
+        }
+        RouterIsis.recalculate(router.id);
+        return true;
+      }
     }
 
     if (cat === 'routing-options') {
@@ -546,7 +586,7 @@
       if (verb === 'top') { return true; } // already at top
 
       if (verb === 'show') {
-        const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp'];
+        const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis'];
         const sub = _ex(parts[1], _SHOW_J);
         if (!sub || sub === '|' || sub === 'all') { showConfig(router, io); return true; }
         // show interfaces etc. from config mode
@@ -599,7 +639,7 @@
     }
 
     if (verb === 'show') {
-      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp'];
+      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis'];
       const sub = _ex(parts[1], _SHOW_J);
       if (sub === 'interfaces' || sub === 'interface') {
         showInterfaces(parts.slice(2), router, io); return true;
@@ -639,6 +679,27 @@
           global.RouterSender.getArpEntries(router.id).forEach(e => {
             const macHex = Array.from(e.mac).map(b => b.toString(16).padStart(2,'0')).join(':');
             io.println(`${macHex.padEnd(18)}${e.ip.padEnd(16)}${e.ip.padEnd(26)}${(e.iface||'-').padEnd(24)}none`);
+          });
+        }
+        return true;
+      }
+      if (sub === 'isis') {
+        const sub2 = _ex(parts[2] || 'adjacency', ['adjacency','database']);
+        if (sub2 === 'adjacency') {
+          const adjs = RouterIsis.getAdjacencies(router.id);
+          io.println('IS-IS adjacency database:');
+          io.println('Interface       L  State         Hold (secs)');
+          if (adjs.length === 0) io.println(' (no IS-IS adjacencies)');
+          adjs.forEach(a => {
+            io.println(`${a.ifaceName.padEnd(16)}${a.level}  ${a.state.padEnd(14)}${29}`);
+          });
+        } else if (sub2 === 'database') {
+          const db = RouterIsis.getDatabase();
+          io.println('IS-IS level 2 link-state database:');
+          io.println('');
+          db.forEach(e => {
+            io.println(`${e.lspId}  Sequence: ${e.seq}  Checksum: ${e.checksum}  Lifetime: ${e.lifetime}`);
+            io.println('  IS neighbor: (links in this domain)');
           });
         }
         return true;
@@ -768,6 +829,46 @@
   };
 
   RouterBgp.registerOsParser('junos', _junosParser);
+
+  // IS-IS パーサ登録
+  RouterIsis.registerOsParser('junos', {
+    getIsisConfig(cfg) {
+      const lines = (cfg || '').split('\n');
+      const hasIsisIf = lines.some(l => /^set protocols isis interface\s+\S+/i.test(l));
+      if (!hasIsisIf) return null;
+
+      const ridM = (cfg || '').match(/^set routing-options router-id\s+([\d.]+)/im);
+      const ifaceList = getInterfaces(cfg);
+      const lo0 = ifaceList.find(f => /^lo/i.test(f.name));
+      const sysIp = ridM ? ridM[1] : (lo0 ? lo0.ip : null);
+      let net = null;
+      if (sysIp) {
+        const octets = sysIp.split('.').map(n => parseInt(n, 10).toString(16).padStart(2, '0'));
+        net = `49.0001.0000.${octets[0]}${octets[1]}.${octets[2]}${octets[3]}.00`;
+      }
+      if (!net) return null;
+
+      const interfaces = [];
+      for (const l of lines) {
+        const m = l.match(/^set protocols isis interface\s+(\S+)(?:\s+metric\s+(\d+))?(?:\s+(passive))?/i);
+        if (!m) continue;
+        const name = m[1];
+        if (name.toLowerCase() === 'all') continue;
+        const existing = interfaces.find(i => i.name === name);
+        if (existing) {
+          if (m[2]) existing.metric = parseInt(m[2]);
+          if (m[3]) existing.passive = true;
+        } else {
+          interfaces.push({ name, metric: m[2] ? parseInt(m[2]) : 10, passive: !!m[3] });
+        }
+      }
+
+      return { process: 'isis', net, isType: 'level-2-only', interfaces };
+    },
+    getInterfaceList(cfg) {
+      return getInterfaces(cfg).map(f => ({ name: f.name, ip: f.ip, mask: f.mask }));
+    },
+  });
 
   global.RouterJunos = { handleCommand, complete, restoreBgpSessions };
 })(window);

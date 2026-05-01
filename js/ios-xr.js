@@ -286,6 +286,96 @@
     if (global.RouterCapture) global.RouterCapture.emit(router.id, pkt, { iface: ifaceName });
   }
 
+  // ---- IS-IS ブロック操作 (IOS-XR: インタフェースはブロック内の1行) ----
+
+  function _updateIsisLine(router, procKey, matchRe, newLine) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^router\\s+isis\\s+${procKey.replace(/[-/]/g, '[-\\/]')}\\s*$`, 'i');
+    if (!headerRe.test(cfg)) {
+      Storage.write(router.id, 'running', (cfg.trimEnd() + `\nrouter isis ${procKey}\n ${newLine}\n`));
+      return;
+    }
+    const lines = cfg.split('\n');
+    let inBlock = false, replaced = false;
+    const out = [];
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { inBlock = true; out.push(t); continue; }
+      if (inBlock) {
+        if (t !== '' && !/^[ \t]/.test(t)) {
+          if (!replaced) { out.push(` ${newLine}`); replaced = true; }
+          inBlock = false;
+        } else if (matchRe.test(t.trim())) {
+          out.push(` ${newLine}`); replaced = true; continue;
+        }
+      }
+      out.push(t);
+    }
+    if (!replaced) out.push(` ${newLine}`);
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  function _removeIsisLine(router, procKey, matchRe) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^router\\s+isis\\s+${procKey.replace(/[-/]/g, '[-\\/]')}\\s*$`, 'i');
+    let inBlock = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { inBlock = true; return true; }
+      if (inBlock) {
+        if (t !== '' && !/^[ \t]/.test(t)) { inBlock = false; return true; }
+        if (matchRe.test(t.trim())) return false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  function _removeIsisBlock(router, procKey) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^router\\s+isis\\s+${procKey.replace(/[-/]/g, '[-\\/]')}\\s*$`, 'i');
+    let skip = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { skip = true; return false; }
+      if (skip) {
+        if (t !== '' && !/^[ \t]/.test(t)) { skip = false; return true; }
+        return false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  function _getIsisIfLine(cfg, procKey, ifaceName) {
+    const headerRe = new RegExp(`^router\\s+isis\\s+${procKey.replace(/[-/]/g, '[-\\/]')}\\s*$`, 'i');
+    const ifRe = new RegExp(`^interface\\s+${ifaceName.replace(/[-/]/g, '[-\\/]')}\\b`, 'i');
+    let inBlock = false;
+    for (const raw of (cfg || '').split('\n')) {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { inBlock = true; continue; }
+      if (!inBlock) continue;
+      if (t !== '' && !/^[ \t]/.test(t)) break;
+      if (ifRe.test(t.trim())) return t.trim();
+    }
+    return null;
+  }
+
+  function _setIsisIfProp(router, procKey, ifaceName, propRe, propStr) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const current = _getIsisIfLine(cfg, procKey, ifaceName) || `interface ${ifaceName}`;
+    let newLine;
+    if (propRe && propRe.test(current)) {
+      newLine = current.replace(propRe, propStr).replace(/\s{2,}/, ' ').trim();
+    } else if (propStr) {
+      newLine = `${current} ${propStr}`.trim();
+    } else {
+      newLine = current;
+    }
+    const matchRe = new RegExp(`^interface\\s+${ifaceName.replace(/[-/]/g, '[-\\/]')}\\b`, 'i');
+    _updateIsisLine(router, procKey, matchRe, newLine);
+  }
+
   // ---- show コマンド ----
 
   const showHandlers = {};
@@ -439,7 +529,7 @@
 
   showHandlers['route'] = (args, router, io) => {
     const cfg = Storage.read(router.id, 'running') || Storage.read(router.id, 'startup') || '';
-    io.println('Codes: C - connected, L - local, S - static, B - BGP');
+    io.println('Codes: C - connected, L - local, S - static, i - ISIS, B - BGP');
     io.println('');
 
     const candidates = [];
@@ -457,6 +547,9 @@
     getStaticRoutes(cfg).forEach(e => {
       candidates.push({ type: 'S', prefix: e.prefix, prefixLen: e.prefixLen, ad: e.ad, metric: 0, nexthop: e.nexthop });
     });
+    RouterIsis.getRib(router.id).forEach(e => {
+      candidates.push({ type: 'I', prefix: e.prefix, prefixLen: e.prefixLen, ad: 115, metric: e.metric, nexthop: e.nexthop, level: e.level });
+    });
     RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self').forEach(e => {
       candidates.push({ type: 'B', prefix: e.prefix, prefixLen: e.prefixLen, ad: 20, metric: 0, nexthop: e.nextHop });
     });
@@ -465,6 +558,7 @@
       if (r.type === 'C') io.println(`C     ${r.prefix}/${r.prefixLen} is directly connected, ${r.via}`);
       else if (r.type === 'L') io.println(`L     ${r.prefix}/${r.prefixLen} is directly connected, ${r.via}`);
       else if (r.type === 'S') io.println(`S     ${r.prefix}/${r.prefixLen} [${r.ad}/0] via ${r.nexthop}`);
+      else if (r.type === 'I') io.println(`i L${r.level}  ${r.prefix}/${r.prefixLen} [115/${r.metric}] via ${r.nexthop}`);
       else if (r.type === 'B') io.println(`B     ${r.prefix}/${r.prefixLen} [20/0] via ${r.nexthop}`);
     });
   };
@@ -491,6 +585,29 @@
     }
   };
 
+  showHandlers['isis'] = (args, router, io) => {
+    const sub = _ex(args[0] || 'neighbors', ['neighbors','database','adjacency']);
+    if (sub === 'neighbors' || sub === 'adjacency') {
+      const cfg = Storage.read(router.id, 'running') || '';
+      const procM = cfg.match(/^router\s+isis\s+(\S+)/im);
+      const procName = procM ? procM[1] : 'default';
+      const adjs = RouterIsis.getAdjacencies(router.id);
+      io.println(`IS-IS ${procName} neighbors:`);
+      io.println('System Id     Interface                SNPA          State Holdtime Type');
+      if (adjs.length === 0) io.println(' (no IS-IS neighbors)');
+      adjs.forEach(a => {
+        io.println(`${a.sysId.padEnd(14)}${a.ifaceName.padEnd(25)}${'*PtoP*'.padEnd(14)}${a.state.padEnd(6)}${String(29).padEnd(9)}L${a.level}`);
+      });
+    } else if (sub === 'database') {
+      const db = RouterIsis.getDatabase();
+      io.println('IS-IS Level-2 Link State Database:');
+      io.println('LSPID                 LSP Seq Num  LSP Checksum  LSP Holdtime  ATT/P/OL');
+      db.forEach(e => {
+        io.println(`${e.lspId.padEnd(22)}${e.seq.padEnd(13)}${e.checksum.padEnd(14)}${String(e.lifetime).padEnd(14)}0/0/0`);
+      });
+    }
+  };
+
   // ---- メインコマンドハンドラ ----
 
   // モード別動詞候補
@@ -499,12 +616,16 @@
   const _ICANDS = ['description','do','end','exit','ipv4','no','shutdown'];
   const _BCANDS = ['bgp','do','end','exit','neighbor','network','no','router-id'];
   const _SCANDS = ['address-family','do','end','exit','no'];
+  const _ISCANDS = ['address-family','end','exit','interface','is-type','net','no'];
+  const _ISIFCANDS = ['address-family','end','exit','metric','no','passive','point-to-point'];
 
   function handleCommand(parts, state, io) {
     const router = state.router;
     const _vcands = state.configMode === 'if' ? _ICANDS
                   : state.configMode === 'router' ? _BCANDS
                   : state.configMode === 'static' ? _SCANDS
+                  : state.configMode === 'isis' ? _ISCANDS
+                  : state.configMode === 'isis-if' ? _ISIFCANDS
                   : state.configMode ? _CCANDS
                   : _ECANDS;
     const verb = _ex(parts[0], _vcands);
@@ -512,11 +633,15 @@
     if (state.configMode) {
       if (verb === 'end') {
         state.configMode = null; state.configIface = null; state.configRouter = null;
+        state.configIsisProcess = null; state.configIsisIface = null;
         return true;
       }
       if (verb === 'exit') {
-        if (state.configMode === 'if' || state.configMode === 'router' || state.configMode === 'static') {
+        if (state.configMode === 'isis-if') {
+          state.configMode = 'isis'; state.configIsisIface = null;
+        } else if (state.configMode === 'if' || state.configMode === 'router' || state.configMode === 'static' || state.configMode === 'isis') {
           state.configMode = 'global'; state.configIface = null; state.configRouter = null;
+          state.configIsisProcess = null; state.configIsisIface = null;
         } else {
           state.configMode = null;
         }
@@ -668,6 +793,84 @@
         return true;
       }
 
+      // ---------- config-isis ----------
+      if (state.configMode === 'isis') {
+        const proc = state.configIsisProcess;
+        if (verb === 'net') {
+          const net = parts[1];
+          if (!net) { io.println('% Incomplete'); return true; }
+          _updateIsisLine(router, proc, /^net\s+/i, `net ${net}`);
+          RouterIsis.recalculate(router.id);
+          return true;
+        }
+        if (verb === 'is-type') {
+          const type = parts[1];
+          if (!type) { io.println('% Incomplete'); return true; }
+          _updateIsisLine(router, proc, /^is-type\s+/i, `is-type ${type}`);
+          RouterIsis.recalculate(router.id);
+          return true;
+        }
+        if (verb === 'interface') {
+          const name = parts[1];
+          if (!name) { io.println('% Incomplete'); return true; }
+          const cfg = Storage.read(router.id, 'running') || '';
+          if (!_getIsisIfLine(cfg, proc, name)) {
+            const matchRe = new RegExp(`^interface\\s+${name.replace(/[-/]/g, '[-\\/]')}\\b`, 'i');
+            _updateIsisLine(router, proc, matchRe, `interface ${name}`);
+          }
+          state.configMode = 'isis-if';
+          state.configIsisIface = name;
+          return true;
+        }
+        if (verb === 'address-family') { return true; }
+        if (verb === 'no') {
+          const sub = _ex(parts[1], ['net','is-type','interface']);
+          if (sub === 'net') { _removeIsisLine(router, proc, /^net\s+/i); RouterIsis.recalculate(router.id); return true; }
+          if (sub === 'is-type') { _removeIsisLine(router, proc, /^is-type\s+/i); RouterIsis.recalculate(router.id); return true; }
+          if (sub === 'interface') {
+            const name = parts[2];
+            if (!name) { io.println('% Incomplete'); return true; }
+            _removeIsisLine(router, proc, new RegExp(`^interface\\s+${name.replace(/[-/]/g, '[-\\/]')}\\b`, 'i'));
+            RouterIsis.recalculate(router.id);
+            return true;
+          }
+        }
+        io.println(`% Invalid input in config-isis: ${parts.join(' ')}`);
+        return true;
+      }
+
+      // ---------- config-isis-if ----------
+      if (state.configMode === 'isis-if') {
+        const proc = state.configIsisProcess;
+        const ifName = state.configIsisIface;
+        if (verb === 'point-to-point' || verb === 'ptp') {
+          _setIsisIfProp(router, proc, ifName, /\bptp\b/i, 'ptp');
+          RouterIsis.recalculate(router.id);
+          return true;
+        }
+        if (verb === 'passive') {
+          _setIsisIfProp(router, proc, ifName, /\bpassive\b/i, 'passive');
+          RouterIsis.recalculate(router.id);
+          return true;
+        }
+        if (verb === 'metric') {
+          const val = parts[1];
+          if (!val || isNaN(+val)) { io.println('% Incomplete: metric value required'); return true; }
+          _setIsisIfProp(router, proc, ifName, /\bmetric\s+\d+/i, `metric ${val}`);
+          RouterIsis.recalculate(router.id);
+          return true;
+        }
+        if (verb === 'address-family') { return true; }
+        if (verb === 'no') {
+          const sub = _ex(parts[1], ['passive','metric','point-to-point']);
+          if (sub === 'passive') { _setIsisIfProp(router, proc, ifName, /\s*\bpassive\b/i, ''); RouterIsis.recalculate(router.id); return true; }
+          if (sub === 'metric') { _setIsisIfProp(router, proc, ifName, /\s*\bmetric\s+\d+/i, ''); RouterIsis.recalculate(router.id); return true; }
+          if (sub === 'point-to-point') { _setIsisIfProp(router, proc, ifName, /\s*\bptp\b/i, ''); RouterIsis.recalculate(router.id); return true; }
+        }
+        io.println(`% Invalid input in config-isis-if: ${parts.join(' ')}`);
+        return true;
+      }
+
       // ---------- global config ----------
 
       // interface <name>
@@ -684,7 +887,7 @@
       }
 
       // router bgp <asn>
-      if (verb === 'router' && (parts[1]||'').toLowerCase() === 'bgp') {
+      if (verb === 'router' && _ex(parts[1], ['bgp','static','isis']) === 'bgp') {
         const asn = parts[2];
         if (!asn || isNaN(+asn)) { io.println('% Specify AS number.'); return true; }
         const procKey = `bgp ${asn}`;
@@ -698,7 +901,7 @@
       }
 
       // router static
-      if (verb === 'router' && _ex(parts[1], ['bgp','static']) === 'static') {
+      if (verb === 'router' && _ex(parts[1], ['bgp','static','isis']) === 'static') {
         const cfg = Storage.read(router.id, 'running') || '';
         if (!/^router\s+static\s*$/im.test(cfg)) {
           Storage.write(router.id, 'running', cfg.trimEnd() + '\nrouter static\n  address-family ipv4 unicast\n');
@@ -707,11 +910,32 @@
         return true;
       }
 
+      // router isis <PROCESS>
+      if (verb === 'router' && _ex(parts[1], ['bgp','static','isis']) === 'isis') {
+        const proc = parts[2] || 'default';
+        const cfg = Storage.read(router.id, 'running') || '';
+        if (!new RegExp(`^router\\s+isis\\s+${proc}\\s*$`, 'im').test(cfg)) {
+          Storage.write(router.id, 'running', cfg.trimEnd() + `\nrouter isis ${proc}\n`);
+        }
+        state.configMode = 'isis';
+        state.configIsisProcess = proc;
+        return true;
+      }
+
       // no router bgp <asn>
-      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname']) === 'router' && _ex(parts[2], ['bgp']) === 'bgp') {
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname']) === 'router' && _ex(parts[2], ['bgp','isis']) === 'bgp') {
         const asn = parts[3];
         if (!asn) { io.println('% Incomplete command.'); return true; }
         _removeRouterBlock(router, `bgp ${asn}`);
+        return true;
+      }
+
+      // no router isis <PROCESS>
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname']) === 'router' && _ex(parts[2], ['bgp','isis']) === 'isis') {
+        const proc = parts[3];
+        if (!proc) { io.println('% Incomplete command.'); return true; }
+        _removeIsisBlock(router, proc);
+        RouterIsis.recalculate(router.id);
         return true;
       }
 
@@ -755,7 +979,7 @@
     }
 
     if (verb === 'show' || verb === 'sh') {
-      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','interfaces','ip','bgp','route','arp'];
+      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','interfaces','ip','bgp','route','arp','isis'];
       const sub = _ex(parts[1], _SHOW_KEYS);
       if (!sub) { io.println('% Incomplete command.'); return true; }
       const handler = showHandlers[sub];
@@ -906,6 +1130,47 @@
   };
 
   RouterBgp.registerOsParser('ios-xr', _iosXrParser);
+
+  // IS-IS パーサ登録
+  RouterIsis.registerOsParser('ios-xr', {
+    getIsisConfig(cfg) {
+      const m = (cfg || '').match(/^router\s+isis\s+(\S+)/im);
+      if (!m) return null;
+      const procKey = m[1];
+      const lines = (cfg || '').split('\n');
+      const headerRe = new RegExp(`^router\\s+isis\\s+${procKey.replace(/[-/]/g,'[-\\/]')}\\s*$`, 'i');
+      let inBlock = false, net = null, isType = 'level-1-2';
+      const interfaces = [];
+      for (const raw of lines) {
+        const t = raw.trimEnd();
+        if (headerRe.test(t)) { inBlock = true; continue; }
+        if (!inBlock) continue;
+        if (t !== '' && !/^[ \t]/.test(t)) break;
+        const trimmed = t.trim();
+        const nm = trimmed.match(/^net\s+(\S+)/i);
+        if (nm) { net = nm[1]; continue; }
+        const tm = trimmed.match(/^is-type\s+(\S+)/i);
+        if (tm) { isType = tm[1]; continue; }
+        const ifM = trimmed.match(/^interface\s+(\S+)(.*)?/i);
+        if (ifM) {
+          const name = ifM[1];
+          const rest = (ifM[2] || '').trim().toLowerCase();
+          const passive = /\bpassive\b/.test(rest);
+          const metM = rest.match(/metric\s+(\d+)/);
+          const metric = metM ? parseInt(metM[1]) : 10;
+          interfaces.push({ name, metric, passive });
+        }
+      }
+      if (!net) return null;
+      return { process: procKey, net, isType, interfaces };
+    },
+    getInterfaceList(cfg) {
+      return parseInterfaces(cfg || '').map(blk => {
+        const info = getIfIpInfo(blk);
+        return info ? { name: blk.name, ip: info.ip, mask: info.mask } : null;
+      }).filter(Boolean);
+    },
+  });
 
   global.RouterIosXr = { handleCommand, complete, restoreBgpSessions };
 })(window);

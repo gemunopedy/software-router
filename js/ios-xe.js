@@ -271,7 +271,7 @@
 
     if (sub === 'route') {
       // show ip route – AD選択ベース
-      io.println('Codes: C - connected, S - static, R - RIP, M - mobile, B - BGP');
+      io.println('Codes: C - connected, S - static, R - RIP, I - ISIS, B - BGP');
       io.println('       D - EIGRP, EX - EIGRP external, O - OSPF, ...');
       io.println('');
       io.println('Gateway of last resort is not set');
@@ -291,6 +291,9 @@
       getStaticRoutes(cfg).forEach(e => {
         candidates.push({ type: 'S', prefix: e.prefix, prefixLen: maskToPrefix(e.mask), ad: e.ad, metric: 0, nexthop: e.nexthop });
       });
+      RouterIsis.getRib(router.id).forEach(e => {
+        candidates.push({ type: 'I', prefix: e.prefix, prefixLen: e.prefixLen, ad: 115, metric: e.metric, nexthop: e.nexthop, level: e.level });
+      });
       RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self').forEach(e => {
         candidates.push({ type: 'B', prefix: e.prefix, prefixLen: e.prefixLen, ad: 20, metric: 0, nexthop: e.nextHop });
       });
@@ -299,6 +302,7 @@
         if (r.type === 'C') io.println(`C     ${r.prefix}/${r.prefixLen} is directly connected, ${r.via}`);
         else if (r.type === 'L') io.println(`L     ${r.prefix}/${r.prefixLen} is directly connected, ${r.via}`);
         else if (r.type === 'S') io.println(`S     ${r.prefix}/${r.prefixLen} [${r.ad}/0] via ${r.nexthop}`);
+        else if (r.type === 'I') io.println(`I L${r.level}  ${r.prefix}/${r.prefixLen} [115/${r.metric}] via ${r.nexthop}`);
         else if (r.type === 'B') io.println(`B     ${r.prefix}/${r.prefixLen} [20/0] via ${r.nexthop}, 00:00:00`);
       });
       return;
@@ -403,6 +407,35 @@
   // show history
   showHandlers['history'] = (args, router, io) => {
     io.println('% Command history is available via the ↑ / ↓ arrow keys in this terminal.');
+  };
+
+  // show isis
+  showHandlers['isis'] = (args, router, io) => {
+    const sub = _ex(args[0] || 'neighbors', ['neighbors','database','adjacency']);
+    if (sub === 'neighbors' || sub === 'adjacency') {
+      const adjs = RouterIsis.getAdjacencies(router.id);
+      io.println('IS-IS neighbors:');
+      io.println('System Id      Interface             State Holdtime Type');
+      if (adjs.length === 0) io.println(' (no IS-IS neighbors)');
+      adjs.forEach(a => {
+        io.println(`${a.sysId.padEnd(15)}${a.ifaceName.padEnd(22)}${a.state.padEnd(6)}${String(29).padEnd(10)}L${a.level}`);
+      });
+    } else if (sub === 'database') {
+      const db = RouterIsis.getDatabase();
+      io.println('IS-IS Level-2 Link State Database:');
+      io.println('LSPID                 LSP Seq Num  LSP Checksum  LSP Holdtime');
+      db.forEach(e => {
+        io.println(`${e.lspId.padEnd(22)}${e.seq.padEnd(13)}${e.checksum.padEnd(14)}${e.lifetime}`);
+      });
+    } else {
+      io.println(`% Unrecognized 'show isis ${args[0]}'`);
+    }
+  };
+
+  // show clns
+  showHandlers['clns'] = (args, router, io) => {
+    if (_ex(args[0], ['neighbors']) === 'neighbors') showHandlers['isis'](['neighbors'], router, io);
+    else io.println(`% Unrecognized 'show clns ${args[0]}'`);
   };
 
   // ------- フィルタ (| include / exclude / section) -------
@@ -751,8 +784,8 @@
   // parts[0] = 動詞（'show' / 'write' / ...）
   // モード別動詞候補（prefix 展開用）
   const _ECANDS = ['configure','clear','copy','disable','enable','exit','help','load-config','no','ping','send','show','write'];
-  const _CCANDS = ['do','end','exit','hostname','interface','ip','no','router'];
-  const _ICANDS = ['description','do','end','exit','ip','no','shutdown'];
+  const _CCANDS = ['do','end','exit','hostname','interface','ip','isis','no','router'];
+  const _ICANDS = ['description','do','end','exit','ip','isis','no','shutdown'];
   const _BCANDS = ['bgp','do','end','exit','neighbor','network','no','router-id'];
 
   function handleCommand(parts, state, io) {
@@ -835,13 +868,66 @@
           return true;
         }
 
+        // ip router isis [PROCESS]
+        if (verb === 'ip' && /^ro/i.test(parts[1] || '') && /^is/i.test(parts[2] || '')) {
+          const proc = parts[3] || '';
+          _updateIfaceLine(router, ifaceName, /^ip router isis/i, `ip router isis${proc ? ' ' + proc : ''}`);
+          RouterIsis.recalculate(router.id);
+          return true;
+        }
+        // no ip router isis
+        if (verb === 'no' && /^ip$/i.test(parts[1] || '') && /^ro/i.test(parts[2] || '') && /^is/i.test(parts[3] || '')) {
+          _removeIfaceLine(router, ifaceName, /^ip router isis/i);
+          RouterIsis.recalculate(router.id);
+          return true;
+        }
+        // isis metric <value>
+        if (/^isis$/i.test(parts[0] || '') && /^me/i.test(parts[1] || '')) {
+          const val = parts[2];
+          if (!val || isNaN(+val)) { io.println('% Incomplete: metric value required'); return true; }
+          _updateIfaceLine(router, ifaceName, /^isis metric/i, `isis metric ${val}`);
+          RouterIsis.recalculate(router.id);
+          return true;
+        }
+        // no isis metric
+        if (verb === 'no' && /^isis$/i.test(parts[1] || '') && /^me/i.test(parts[2] || '')) {
+          _removeIfaceLine(router, ifaceName, /^isis metric/i);
+          RouterIsis.recalculate(router.id);
+          return true;
+        }
+
         io.println(`% Invalid input in config-if mode: ${parts.join(' ')}`);
         return true;
       }
 
       // ---------- config-router モード ----------
       if (state.configMode === 'router') {
-        const procKey = state.configRouter; // e.g. 'bgp 65001'
+        const procKey = state.configRouter; // e.g. 'bgp 65001' or 'isis CORE'
+
+        // IS-IS router mode
+        if ((procKey || '').toLowerCase().startsWith('isis')) {
+          if (verb === 'net') {
+            const net = parts[1];
+            if (!net) { io.println('% Incomplete command.'); return true; }
+            _updateRouterLine(router, procKey, /^net\s+/i, `net ${net}`);
+            RouterIsis.recalculate(router.id);
+            return true;
+          }
+          if (verb === 'is-type') {
+            const type = parts[1];
+            if (!type) { io.println('% Incomplete command.'); return true; }
+            _updateRouterLine(router, procKey, /^is-type\s+/i, `is-type ${type}`);
+            RouterIsis.recalculate(router.id);
+            return true;
+          }
+          if (verb === 'no') {
+            const sub = _ex(parts[1], ['net','is-type']);
+            if (sub === 'net') { _removeRouterLine(router, procKey, /^net\s+/i); RouterIsis.recalculate(router.id); return true; }
+            if (sub === 'is-type') { _removeRouterLine(router, procKey, /^is-type\s+/i); RouterIsis.recalculate(router.id); return true; }
+          }
+          io.println(`% Invalid input in config-router-isis: ${parts.join(' ')}`);
+          return true;
+        }
 
         // neighbor <ip> remote-as <as>
         if (verb === 'neighbor') {
@@ -945,7 +1031,7 @@
       }
 
       // router bgp <as-number>
-      if (verb === 'router' && (parts[1] || '').toLowerCase() === 'bgp') {
+      if (verb === 'router' && _ex(parts[1], ['bgp','isis']) === 'bgp') {
         const asn = parts[2];
         if (!asn || isNaN(+asn)) { io.println('% Incomplete command: specify AS number.'); return true; }
         const procKey = `bgp ${asn}`;
@@ -960,11 +1046,33 @@
         return true;
       }
 
+      // router isis [PROCESS]
+      if (verb === 'router' && _ex(parts[1], ['bgp','isis']) === 'isis') {
+        const proc = parts[2] || 'default';
+        const procKey = `isis ${proc}`;
+        const cfg = Storage.read(router.id, 'running') || '';
+        if (!new RegExp(`^router\\s+isis\\s+${proc}\\s*$`, 'im').test(cfg)) {
+          Storage.write(router.id, 'running', cfg.trimEnd() + `\nrouter isis ${proc}\n`);
+        }
+        state.configMode = 'router';
+        state.configRouter = procKey;
+        return true;
+      }
+
       // no router bgp <as-number>
-      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'router' && _ex(parts[2], ['bgp']) === 'bgp') {
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'router' && _ex(parts[2], ['bgp','isis']) === 'bgp') {
         const asn = parts[3];
         if (!asn) { io.println('% Incomplete command.'); return true; }
         _removeRouterBlock(router, `bgp ${asn}`);
+        return true;
+      }
+
+      // no router isis [PROCESS]
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'router' && _ex(parts[2], ['bgp','isis']) === 'isis') {
+        const proc = parts[3];
+        if (!proc) { io.println('% Incomplete command.'); return true; }
+        _removeRouterBlock(router, `isis ${proc}`);
+        RouterIsis.recalculate(router.id);
         return true;
       }
 
@@ -1043,7 +1151,7 @@
 
     // --- show ---
     if (verb === 'show' || verb === 'sh') {
-      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','ip','arp','interfaces','ospf','clock','history'];
+      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','ip','arp','interfaces','ospf','clock','history','isis','clns'];
       const sub = _ex(parts[1], _SHOW_KEYS);
       if (!sub) {
         io.println('% Incomplete command. Type "show ?" for help.');
@@ -1323,6 +1431,50 @@
     },
   };
   RouterBgp.registerOsParser('ios-xe', _iosXeParser);
+
+  // IS-IS パーサ登録
+  RouterIsis.registerOsParser('ios-xe', {
+    getIsisConfig(cfg) {
+      const m = (cfg || '').match(/^router\s+isis\s*(\S*)/im);
+      if (!m) return null;
+      const process = m[1] || 'default';
+      const lines = (cfg || '').split('\n');
+      let inBlock = false, net = null, isType = 'level-1-2';
+      const interfaces = [];
+      for (const raw of lines) {
+        const t = raw.trimEnd();
+        if (/^router\s+isis/i.test(t)) { inBlock = true; continue; }
+        if (inBlock) {
+          if (t !== '' && !/^[ \t]/.test(t)) { inBlock = false; continue; }
+          const trimmed = t.trim();
+          const nm = trimmed.match(/^net\s+(\S+)/i);
+          if (nm) { net = nm[1]; continue; }
+          const tm = trimmed.match(/^is-type\s+(\S+)/i);
+          if (tm) { isType = tm[1]; continue; }
+        }
+      }
+      parseInterfaces(cfg).forEach(blk => {
+        const isisLine = blk.lines.find(l => /^ip\s+router\s+isis/i.test(l));
+        if (!isisLine) return;
+        const metricLine = blk.lines.find(l => /^isis\s+metric/i.test(l));
+        const metric = metricLine ? (parseInt(metricLine.split(/\s+/)[2]) || 10) : 10;
+        const passiveLine = blk.lines.find(l => /^isis\s+passive/i.test(l));
+        interfaces.push({ name: blk.name, metric, passive: !!passiveLine });
+      });
+      if (!net) return null;
+      return { process, net, isType, interfaces };
+    },
+    getInterfaceList(cfg) {
+      return parseInterfaces(cfg).map(blk => ({
+        name: blk.name,
+        ip: getIfaceIp(blk),
+        mask: getIfaceMask(blk),
+      })).filter(f => f.ip);
+    },
+  });
+
+  // すべての OS パーサが登録されたあとに IS-IS ルートを復元する
+  setTimeout(() => RouterIsis.restoreAll(), 0);
 
   global.RouterIosXe = { handleCommand, complete, restoreBgpSessions };
 })(window);

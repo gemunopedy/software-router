@@ -15,7 +15,7 @@
 window.RouterRib = (() => {
   'use strict';
 
-  const AD = { C: 0, L: 0, S: 1, B: 20 };
+  const AD = { C: 0, L: 0, S: 1, B: 20, I: 115 };
 
   /**
    * candidates[] を受け取り、AD 選択後の best-route 配列を返す。
