@@ -1,5 +1,5 @@
 // ネットワークトポロジー定義（ロジックなし・データのみ）
-// 各ノードは仮想ルータを表す。os は 'ios-xe' | 'ios-xr' | 'junos'。
+// 各ノードは仮想ルータを表す。os は 'ios-xe' | 'ios-xr'。
 // links は両端のノードIDを ports と共に持つ。
 window.TOPOLOGY = {
   nodes: [
@@ -10,7 +10,7 @@ window.TOPOLOGY = {
       x: 120, y: 120,
       defaultConfig:
         'hostname R1-XE\n' +
-        'interface GigabitEthernet1\n' +
+        'interface GigabitEthernet0/0\n' +
         ' ip address 10.0.12.1 255.255.255.0\n' +
         ' description link to R2\n' +
         '!\n' +
@@ -40,14 +40,14 @@ window.TOPOLOGY = {
       x: 250, y: 280,
       defaultConfig:
         'hostname R3-XE\n' +
-        'interface GigabitEthernet1\n' +
+        'interface GigabitEthernet0/0\n' +
         ' ip address 10.0.23.3 255.255.255.0\n' +
         ' description link to R2\n' +
         '!\n',
     },
   ],
   links: [
-    { a: 'R1', b: 'R2', aPort: 'Gi1',   bPort: 'Gi0/0' },
-    { a: 'R2', b: 'R3', aPort: 'Gi0/1', bPort: 'Gi1'   },
+    { a: 'R1', b: 'R2', aPort: 'Gi0/0', bPort: 'Gi0/0' },
+    { a: 'R2', b: 'R3', aPort: 'Gi0/1', bPort: 'Gi0/0' },
   ],
 };

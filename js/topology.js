@@ -88,11 +88,6 @@
         ev.stopPropagation();
         opts.onNodeDblClick && opts.onNodeDblClick(node.id, ev);
       });
-      g.addEventListener('contextmenu', ev => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        opts.onNodeContextMenu && opts.onNodeContextMenu(node.id, ev);
-      });
       svg.appendChild(g);
     });
 
