@@ -586,8 +586,8 @@
     }
 
     if (verb === 'write' || verb === 'wr') {
-      io.println('unknown command: write');
-      io.println('Use "edit" then "commit" to save configuration.');
+      io.println("unknown command: write");
+      io.println("Use 'edit' then 'commit' to save configuration.");
       return true;
     }
 

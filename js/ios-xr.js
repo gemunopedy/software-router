@@ -633,24 +633,12 @@
     }
 
     if (verb === 'write' || verb === 'wr') {
-      const sub = (parts[1] || 'memory').toLowerCase();
-      if (sub === 'memory' || sub === 'mem' || verb === 'wr') {
-        Storage.write(router.id, 'startup', Storage.read(router.id, 'running'));
-        io.println('Building configuration...');
-        io.println('[OK]');
-        return true;
-      }
+      io.println("% 'write memory' is not supported on IOS-XR. Use 'commit'.");
       return true;
     }
 
     if (verb === 'copy') {
-      const src = (parts[1]||'').toLowerCase(), dst = (parts[2]||'').toLowerCase();
-      if (src === 'running-config' && dst === 'startup-config') {
-        Storage.write(router.id, 'startup', Storage.read(router.id, 'running'));
-        io.println('[OK]');
-        return true;
-      }
-      io.println(`% copy ${src} ${dst} is not supported in emulation`);
+      io.println("% 'copy' is not supported on IOS-XR. Use 'commit'.");
       return true;
     }
 
@@ -699,7 +687,7 @@
 
     // exec mode
     if (before.length === 0) {
-      return ['configure','show','write','commit','copy','load-config','clear','exit','help']
+      return ['configure','show','commit','load-config','clear','exit','help']
         .filter(c => c.startsWith(last.toLowerCase()));
     }
     const verb = before[0];
