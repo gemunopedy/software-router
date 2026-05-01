@@ -105,9 +105,9 @@
     }
     const mac = Packets.buildIfaceMac(topoIdx(router.id), ifaceIdx);
     const pkt = Packets.buildPacket({
-      proto: 'arp', op: 1,
+      proto: 'arp', op: 'reply',
       src: addr, dst: addr,
-      srcMac: mac,
+      srcMac: mac, targetMac: 'ff:ff:ff:ff:ff:ff',
     });
     const Pcap = global.RouterPcap;
     if (Pcap) { Pcap.append(router.id, pkt); if (global.AppRefreshPcapStatus) global.AppRefreshPcapStatus(); }

@@ -70,12 +70,15 @@
       const tIp  = ip4(pkt, 14 + 24);
       const sMac = mac(pkt, 14 + 8);
       const bits = macBits(pkt[14 + 8]);
-      const isGarp = op === 1 && sIp === tIp;
+      const isGarp = sIp === tIp;
       if (op === 1) {
-        const prefix = isGarp ? `GARP [${bits}]  ${sIp}` : `ARP  Who has ${tIp}?  Tell ${sIp}`;
+        const prefix = isGarp ? `Gratuitous ARP for ${sIp} (Request)` : `ARP  Who has ${tIp}?  Tell ${sIp}`;
         return `${prefix}  (${total}B)`;
       }
-      if (op === 2) return `ARP  ${sIp} is at ${sMac} [${bits}]  (${total}B)`;
+      if (op === 2) {
+        const prefix = isGarp ? `Gratuitous ARP for ${sIp} (Reply)` : `ARP  ${sIp} is at ${sMac} [${bits}]`;
+        return `${prefix}  (${total}B)`;
+      }
       return `ARP  op=${op}  (${total}B)`;
     }
 
