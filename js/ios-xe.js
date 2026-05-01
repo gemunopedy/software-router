@@ -1255,13 +1255,13 @@
       if ((v === 'interface' || v === 'int') && before.length === 1)
         return ifaceNames().filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
       if (v === 'router' && before.length === 1)
-        return ['bgp'].filter(s => s.startsWith(last.toLowerCase()));
+        return ['bgp', 'isis'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'no' && before.length === 1)
         return ['interface', 'router'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'no' && (before[1] === 'interface' || before[1] === 'int') && before.length === 2)
         return ifaceNames().filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
       if (v === 'no' && before[1] === 'router' && before.length === 2)
-        return ['bgp'].filter(s => s.startsWith(last.toLowerCase()));
+        return ['bgp', 'isis'].filter(s => s.startsWith(last.toLowerCase()));
       return [];
     }
 
