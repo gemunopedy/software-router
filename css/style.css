@@ -168,6 +168,47 @@ body.tool-delete .topo-node circle { cursor: pointer; }
   font-weight: normal;
 }
 
+/* ----- port dots ----- */
+.topo-port {
+  pointer-events: none;
+  transition: r 0.1s, opacity 0.15s;
+}
+.topo-port-used {
+  fill: #fff;
+  stroke: #2d6cdf;
+  stroke-width: 2;
+}
+.topo-port-free {
+  fill: transparent;
+  stroke: rgba(255,255,255,0.45);
+  stroke-width: 1.5;
+  pointer-events: all;
+  cursor: crosshair;
+  opacity: 0;
+}
+.topo-node:hover .topo-port-free {
+  opacity: 1;
+  stroke: #fff;
+  stroke-width: 2;
+}
+.topo-node.link-pending .topo-port-free {
+  opacity: 1;
+  fill: #ffd866;
+  stroke: #ffd866;
+}
+.topo-port-free:hover {
+  fill: #ffd866;
+  stroke: #ffd866;
+}
+
+/* ゴムバンドライン */
+.topo-rubber {
+  stroke: #ffd866;
+  stroke-width: 2;
+  stroke-dasharray: 6 4;
+  pointer-events: none;
+}
+
 /* mode 別カーソル */
 body.tool-add-router #topo-svg { cursor: crosshair; }
 body.tool-add-link  #topo-svg { cursor: cell; }

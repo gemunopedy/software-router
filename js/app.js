@@ -108,10 +108,9 @@
     onToolChange: (tool) => {
       const hints = {
         'add-router': '空白をクリックでルータ追加',
-        'add-link': '2つのノードを順にクリックでリンク作成',
         'delete': 'ノードまたはリンクをクリックで削除',
       };
-      editHint.textContent = tool ? `[${tool}] ${hints[tool] || ''}` : '';
+      editHint.textContent = tool ? `[${tool}] ${hints[tool] || ''}` : 'ノード端のポートをクリックしてリンク作成';
     },
   });
 
@@ -243,7 +242,6 @@
   // ----- ツールバー -----
   const chkEdit = document.getElementById('chk-edit');
   const btnAddRouter = document.getElementById('btn-add-router');
-  const btnAddLink = document.getElementById('btn-add-link');
   const btnDelete = document.getElementById('btn-delete');
   const btnSave = document.getElementById('btn-save');
   const btnClear = document.getElementById('btn-clear');
@@ -378,9 +376,8 @@
   let currentTool = null;
   function setTool(t) {
     currentTool = (currentTool === t) ? null : t;
-    [btnAddRouter, btnAddLink, btnDelete].forEach(b => b.classList.remove('active'));
+    [btnAddRouter, btnDelete].forEach(b => b.classList.remove('active'));
     if (currentTool === 'add-router') btnAddRouter.classList.add('active');
-    if (currentTool === 'add-link') btnAddLink.classList.add('active');
     if (currentTool === 'delete') btnDelete.classList.add('active');
     editor.setTool(currentTool);
   }
@@ -388,12 +385,11 @@
     editor.setEditMode(chkEdit.checked);
     if (!chkEdit.checked) {
       currentTool = null;
-      [btnAddRouter, btnAddLink, btnDelete].forEach(b => b.classList.remove('active'));
+      [btnAddRouter, btnDelete].forEach(b => b.classList.remove('active'));
       editHint.textContent = '';
     }
   });
   btnAddRouter.addEventListener('click', () => setTool('add-router'));
-  btnAddLink.addEventListener('click', () => setTool('add-link'));
   btnDelete.addEventListener('click', () => setTool('delete'));
 
   btnSave.addEventListener('click', () => {

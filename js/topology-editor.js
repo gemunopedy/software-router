@@ -60,9 +60,10 @@
     const svg = opts.svg;
     let topology = opts.topology;
     let editMode = false;
-    let tool = null;            // 'add-router' | 'add-link' | 'delete' | null
-    let linkPending = null;     // Add Link 中の最初のノードID
+    let tool = null;            // 'add-router' | 'delete' | null
     let drag = null;            // { id, offsetX, offsetY, moved }
+    let portPending = null;     // { nodeId, x, y } – ポートリンク作成中
+    let _rubberEnd = null;      // ゴムバンド現在終点 { x, y }
 
     // ---- ズーム / パン ----
     let _savedVB = null; // null = 自然サイズ (render が設定した viewBox)
@@ -135,6 +136,8 @@
         onBackgroundClick: handleBackgroundClick,
         onNodeContextMenu: (id, ev) =>
           opts.onNodeContextMenu && opts.onNodeContextMenu(id, ev),
+        onPortMouseDown: handlePortMouseDown,
+        onPortClick: handlePortClick,
       });
       // ズーム状態を再適用（render 内の setViewBox を上書き）
       if (_savedVB) svg.setAttribute('viewBox', _savedVB);
@@ -143,7 +146,10 @@
         const sel = opts.getSelectedRouter();
         if (sel) Topology.setSelected(svg, sel);
       }
-      if (linkPending) Topology.setLinkPending(svg, linkPending);
+      if (portPending) {
+        Topology.setLinkPending(svg, portPending.nodeId);
+        if (_rubberEnd) _showRubberBand(portPending.x, portPending.y, _rubberEnd.x, _rubberEnd.y);
+      }
     }
 
     function setTopology(t) { topology = t; refresh(); }
@@ -158,7 +164,7 @@
 
     function setTool(t) {
       tool = t;
-      linkPending = null;
+      _cancelPortPending();
       ['tool-add-router', 'tool-add-link', 'tool-delete'].forEach(c =>
         document.body.classList.remove(c));
       if (tool) document.body.classList.add(`tool-${tool}`);
@@ -170,6 +176,13 @@
     function handleNodeClick(id, ev) {
       if (drag && drag.moved) { drag = null; return; } // ドラッグ後のクリックは無視
 
+      // ポートリンク作成中: ノード本体クリックでリンク完成
+      if (portPending) {
+        if (portPending.nodeId !== id) _completePortLink(id);
+        else _cancelPortPending();
+        return;
+      }
+
       if (!editMode) {
         opts.onRouterSelect && opts.onRouterSelect(id);
         return;
@@ -179,24 +192,6 @@
         topology.nodes = topology.nodes.filter(n => n.id !== id);
         topology.links = topology.links.filter(l => l.a !== id && l.b !== id);
         opts.onNodeDeleted && opts.onNodeDeleted(id);
-        opts.onTopologyChange && opts.onTopologyChange(topology);
-        refresh();
-        return;
-      }
-      if (tool === 'add-link') {
-        if (linkPending == null) {
-          linkPending = id;
-          Topology.setLinkPending(svg, id);
-          return;
-        }
-        if (linkPending === id) { linkPending = null; refresh(); return; }
-        // リンク作成
-        const a = linkPending;
-        const b = id;
-        const aPort = nextPort(topology, a);
-        const bPort = nextPort(topology, b);
-        topology.links.push({ a, b, aPort, bPort });
-        linkPending = null;
         opts.onTopologyChange && opts.onTopologyChange(topology);
         refresh();
         return;
@@ -244,6 +239,7 @@
     }
 
     function handleBackgroundClick(ev) {
+      if (portPending) { _cancelPortPending(); return; }
       if (!editMode) return;
       if (tool === 'add-router') {
         const { x, y } = Topology.clientToViewBox(svg, ev.clientX, ev.clientY);
@@ -261,6 +257,69 @@
         refresh();
       }
     }
+
+    // ----- ゴムバンドライン -----
+    function _showRubberBand(x1, y1, x2, y2) {
+      _removeRubberBand();
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      line.setAttribute('class', 'topo-rubber');
+      line.setAttribute('x1', x1); line.setAttribute('y1', y1);
+      line.setAttribute('x2', x2); line.setAttribute('y2', y2);
+      svg.appendChild(line);
+    }
+    function _updateRubberBand(x2, y2) {
+      const line = svg.querySelector('.topo-rubber');
+      if (line) { line.setAttribute('x2', x2); line.setAttribute('y2', y2); }
+    }
+    function _removeRubberBand() {
+      svg.querySelectorAll('.topo-rubber').forEach(l => l.remove());
+    }
+
+    // ----- ポートリンク作成 -----
+    function handlePortMouseDown(nodeId, px, py, ev) {
+      if (!editMode || tool === 'delete') return;
+      // mousedown 時点では何もしない（click で処理）
+    }
+    function handlePortClick(nodeId, px, py, ev) {
+      if (!editMode || tool === 'delete') return;
+      if (!portPending) {
+        portPending = { nodeId, x: px, y: py };
+        _rubberEnd = { x: px, y: py };
+        refresh();
+        svg.addEventListener('mousemove', _onRubberMove);
+      } else if (portPending.nodeId === nodeId) {
+        _cancelPortPending();
+      } else {
+        _completePortLink(nodeId);
+      }
+    }
+    function _completePortLink(targetId) {
+      const a = portPending.nodeId, b = targetId;
+      const aPort = nextPort(topology, a);
+      const bPort = nextPort(topology, b);
+      topology.links.push({ a, b, aPort, bPort });
+      _cancelPortPending();
+      opts.onTopologyChange && opts.onTopologyChange(topology);
+      refresh();
+    }
+    function _cancelPortPending() {
+      portPending = null;
+      _rubberEnd = null;
+      _removeRubberBand();
+      svg.removeEventListener('mousemove', _onRubberMove);
+      refresh();
+    }
+    function _onRubberMove(ev) {
+      if (!portPending) return;
+      const p = Topology.clientToViewBox(svg, ev.clientX, ev.clientY);
+      _rubberEnd = p;
+      _updateRubberBand(p.x, p.y);
+    }
+
+    // Escape でキャンセル
+    window.addEventListener('keydown', ev => {
+      if (ev.key === 'Escape' && portPending) _cancelPortPending();
+    });
 
     // ----- ドラッグ -----
     // 編集モードに関わらず常にノードをドラッグ移動可能にする。

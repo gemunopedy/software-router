@@ -64,14 +64,61 @@
     // nodes
     topology.nodes.forEach(node => {
       const g = el('g', { class: 'topo-node', 'data-id': node.id });
-      const r = 36;
-      g.appendChild(el('circle', { cx: node.x, cy: node.y, r }));
+      const NODE_R = 36;
+      g.appendChild(el('circle', { cx: node.x, cy: node.y, r: NODE_R }));
       const tId = el('text', { x: node.x, y: node.y - 4 });
       tId.textContent = node.id;
       g.appendChild(tId);
       const tOs = el('text', { x: node.x, y: node.y + 14, class: 'os-tag' });
       tOs.textContent = (node.os || '').toUpperCase();
       g.appendChild(tOs);
+
+      // ポートドット（Edit Mode のみ）
+      if (opts.editMode) {
+        const PORT_R = 5;
+        // 隣接ノードへの角度（既存リンク）
+        const usedAngles = [];
+        for (const link of topology.links) {
+          const nbId = link.a === node.id ? link.b : link.b === node.id ? link.a : null;
+          if (!nbId) continue;
+          const nb = nodeMap[nbId];
+          if (!nb) continue;
+          const angle = Math.atan2(nb.y - node.y, nb.x - node.x);
+          usedAngles.push(angle);
+          // 接続済みポート（小黒点・クリック不可）
+          const px = node.x + NODE_R * Math.cos(angle);
+          const py = node.y + NODE_R * Math.sin(angle);
+          const dot = el('circle', { class: 'topo-port topo-port-used', cx: px, cy: py, r: PORT_R });
+          g.appendChild(dot);
+        }
+
+        // フリーポート: 最も余裕のある角度
+        let freeAngle = -Math.PI / 2; // デフォルト: 上
+        if (usedAngles.length > 0) {
+          const sorted = [...usedAngles].sort((a, b) => a - b);
+          let maxGap = 0;
+          for (let i = 0; i < sorted.length; i++) {
+            const a1 = sorted[i];
+            const a2 = sorted[(i + 1) % sorted.length];
+            let gap = a2 - a1;
+            if (gap <= 0) gap += 2 * Math.PI;
+            if (gap > maxGap) { maxGap = gap; freeAngle = a1 + gap / 2; }
+          }
+        }
+        const fpx = node.x + NODE_R * Math.cos(freeAngle);
+        const fpy = node.y + NODE_R * Math.sin(freeAngle);
+        const freeDot = el('circle', { class: 'topo-port topo-port-free', cx: fpx, cy: fpy, r: PORT_R });
+        g.appendChild(freeDot);
+        freeDot.addEventListener('mousedown', ev => {
+          ev.stopPropagation(); // ノードドラッグを抑止
+          ev.preventDefault();
+          opts.onPortMouseDown && opts.onPortMouseDown(node.id, fpx, fpy, ev);
+        });
+        freeDot.addEventListener('click', ev => {
+          ev.stopPropagation();
+          opts.onPortClick && opts.onPortClick(node.id, fpx, fpy, ev);
+        });
+      }
 
       // mousedown/click はエディタ層で詳細処理
       g.addEventListener('mousedown', ev => {
