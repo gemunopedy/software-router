@@ -341,8 +341,9 @@
     const asn = getBgpAs(cfg);
     const rid = getBgpRouterId(cfg);
     const staticRoutes = getStaticRoutes(cfg);
+    const srv6Cfg = getSrv6Config(cfg);
     const roM = cfg.match(/^set routing-options/gim);
-    if (roM || staticRoutes.length) {
+    if (roM || staticRoutes.length || srv6Cfg) {
       io.println('routing-options {');
       if (asn) io.println(`    autonomous-system ${asn};`);
       if (rid) io.println(`    router-id ${rid};`);
@@ -352,6 +353,17 @@
           const pref = e.ad !== 1 ? ` preference ${e.ad}` : '';
           io.println(`        route ${e.prefix}/${e.prefixLen} next-hop ${e.nexthop};${pref}`);
         });
+        io.println('    }');
+      }
+      if (srv6Cfg) {
+        io.println('    source-packet-routing {');
+        io.println('        srv6 {');
+        for (const loc of srv6Cfg.locators) {
+          io.println(`            locator ${loc.name} {`);
+          if (loc.prefix !== undefined) io.println(`                prefix ${loc.prefix}/${loc.prefixLen};`);
+          io.println('            }');
+        }
+        io.println('        }');
         io.println('    }');
       }
       io.println('}');
@@ -498,6 +510,43 @@
     return { interfaces, ldpRouterId: null };
   }
 
+  // --- SRv6 設定パーサ ---
+  // 設定形式: set routing-options source-packet-routing srv6 locator <NAME> prefix <P/L>
+  //           set protocols isis source-packet-routing srv6 locator <NAME>
+  function getSrv6Config(cfg) {
+    const lines = (cfg || '').split('\n');
+    let srv6Enabled = false;
+    let igpType = null;
+    const locatorMap = new Map();
+
+    for (const l of lines) {
+      // ロケーター prefix
+      const locM = l.match(/^set routing-options source-packet-routing srv6 locator\s+(\S+)\s+prefix\s+([\w:]+)\/([\d]+)/i);
+      if (locM) {
+        srv6Enabled = true;
+        const name = locM[1];
+        if (!locatorMap.has(name)) locatorMap.set(name, { name, prefix: locM[2], prefixLen: parseInt(locM[3]) });
+        else { locatorMap.get(name).prefix = locM[2]; locatorMap.get(name).prefixLen = parseInt(locM[3]); }
+        continue;
+      }
+      // ロケーター宣言のみ（prefix なし）
+      const locDeclM = l.match(/^set routing-options source-packet-routing srv6 locator\s+(\S+)\s*$/i);
+      if (locDeclM) {
+        srv6Enabled = true;
+        if (!locatorMap.has(locDeclM[1])) locatorMap.set(locDeclM[1], { name: locDeclM[1] });
+        continue;
+      }
+      // ISIS で SRv6 利用
+      if (/^set protocols isis source-packet-routing srv6\b/i.test(l)) {
+        igpType = 'isis';
+        continue;
+      }
+    }
+
+    if (!srv6Enabled) return null;
+    return { srv6Enabled, igpType, locators: [...locatorMap.values()] };
+  }
+
   function showOspf(args, router, io) {
     const sub = _ex(args[0] || 'neighbor', ['neighbor','database']);
     if (sub === 'neighbor') {
@@ -605,6 +654,20 @@
           return true;
         }
       }
+      // set routing-options source-packet-routing srv6 locator <NAME> [prefix <P/L>]
+      if (key === 'source-packet-routing' && (rest[1] || '').toLowerCase() === 'srv6' && (rest[2] || '').toLowerCase() === 'locator' && rest[3]) {
+        const locName = rest[3];
+        if ((rest[4] || '').toLowerCase() === 'prefix' && rest[5] && rest[5].includes('/')) {
+          _deleteLines(router, new RegExp(`^set routing-options source-packet-routing srv6 locator ${locName} prefix\\s+`, 'i'));
+          _setLine(router, `set routing-options source-packet-routing srv6 locator ${locName} prefix ${rest[5]}`);
+        } else {
+          if (_setLineMissing(router, `set routing-options source-packet-routing srv6 locator ${locName}`)) {
+            _setLine(router, `set routing-options source-packet-routing srv6 locator ${locName}`);
+          }
+        }
+        if (window.RouterSrv6) window.RouterSrv6.recalculate();
+        return true;
+      }
     }
 
     if (cat === 'protocols') {
@@ -688,10 +751,22 @@
           if (sprest[0] === 'srgb' && sprest[1] === 'start-label' && sprest[2] && sprest[3] === 'index-range' && sprest[4]) {
             _deleteLines(router, /^set protocols isis source-packet-routing srgb/i);
             _setLine(router, `set protocols isis source-packet-routing srgb start-label ${sprest[2]} index-range ${sprest[4]}`);
+            if (window.RouterSr) window.RouterSr.recalculate();
+          } else if ((sprest[0] || '').toLowerCase() === 'srv6') {
+            // set protocols isis source-packet-routing srv6 [locator <NAME>]
+            if ((sprest[1] || '').toLowerCase() === 'locator' && sprest[2]) {
+              _deleteLines(router, /^set protocols isis source-packet-routing srv6\b/i);
+              _setLine(router, `set protocols isis source-packet-routing srv6 locator ${sprest[2]}`);
+            } else {
+              if (_setLineMissing(router, 'set protocols isis source-packet-routing srv6')) {
+                _setLine(router, 'set protocols isis source-packet-routing srv6');
+              }
+            }
+            if (window.RouterSrv6) window.RouterSrv6.recalculate();
           } else {
             _setLine(router, `set protocols isis source-packet-routing${sprest.length ? ' ' + sprest.join(' ') : ''}`);
+            if (window.RouterSr) window.RouterSr.recalculate();
           }
-          if (window.RouterSr) window.RouterSr.recalculate();
           return true;
         }
         if ((isisRest[0] || '').toLowerCase() === 'interface') {
@@ -857,10 +932,19 @@
         if ((isisRest[0] || '').toLowerCase() === 'source-packet-routing') {
           if (isisRest[1] === 'srgb') {
             _deleteLines(router, /^set protocols isis source-packet-routing srgb\s+/i);
+            if (window.RouterSr) window.RouterSr.recalculate();
+          } else if (isisRest[1] === 'srv6') {
+            if ((isisRest[2] || '').toLowerCase() === 'locator' && isisRest[3]) {
+              _deleteLines(router, new RegExp(`^set protocols isis source-packet-routing srv6 locator ${isisRest[3]}\\b`, 'i'));
+            } else {
+              _deleteLines(router, /^set protocols isis source-packet-routing srv6\b/i);
+            }
+            if (window.RouterSrv6) window.RouterSrv6.recalculate();
           } else {
             _deleteLines(router, /^set protocols isis source-packet-routing/i);
+            if (window.RouterSr) window.RouterSr.recalculate();
+            if (window.RouterSrv6) window.RouterSrv6.recalculate();
           }
-          if (window.RouterSr) window.RouterSr.recalculate();
           return true;
         }
         if ((isisRest[0] || '').toLowerCase() === 'interface') {
@@ -916,6 +1000,16 @@
         const cidr6 = rest[4];
         const cidr6Esc = cidr6.replace(/:/g,'\\:').replace('/','\/');
         _deleteLines(router, new RegExp(`^set routing-options rib inet6\\.0 static route ${cidr6Esc}\\s+`, 'i'));
+        return true;
+      }
+      // delete routing-options source-packet-routing srv6 [locator <NAME>]
+      if (key === 'source-packet-routing' && (rest[1] || '').toLowerCase() === 'srv6') {
+        if ((rest[2] || '').toLowerCase() === 'locator' && rest[3]) {
+          _deleteLines(router, new RegExp(`^set routing-options source-packet-routing srv6 locator ${rest[3]}`, 'i'));
+        } else {
+          _deleteLines(router, /^set routing-options source-packet-routing srv6\b/i);
+        }
+        if (window.RouterSrv6) window.RouterSrv6.recalculate();
         return true;
       }
     }
@@ -1021,8 +1115,59 @@
     }
 
     if (verb === 'show') {
-      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances','ldp','spring-te','ipv6'];
+      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances','ldp','spring-te','ipv6','srv6'];
       const sub = _ex(parts[1], _SHOW_J);
+
+      // show srv6
+      if (sub === 'srv6') {
+        if (!window.RouterSrv6) { io.println('% SRv6 not initialized'); return true; }
+        const sub2 = _ex(parts[2] || 'locator', ['locator', 'sid', 'state']);
+        if (sub2 === 'locator') {
+          const locs = window.RouterSrv6.getLocators(router.id);
+          if (locs.length === 0) { io.println('  (SRv6 not configured)'); return true; }
+          io.println('Locator Name     Prefix                    SID Count');
+          for (const loc of locs) {
+            const sids = window.RouterSrv6.getSidDb(router.id).filter(e => e.locatorName === loc.name);
+            const pfx = loc.prefix ? `${loc.prefix}/${loc.prefixLen}` : '-';
+            io.println(`${loc.name.padEnd(17)}${pfx.padEnd(26)}${sids.length}`);
+          }
+          return true;
+        }
+        if (sub2 === 'sid') {
+          const sids = window.RouterSrv6.getSidDb(router.id);
+          io.println('SID                    Behavior  Locator    State');
+          if (sids.length === 0) { io.println('  (none)'); return true; }
+          for (const s of sids) {
+            io.println(`${s.sid.padEnd(23)}${s.behavior.padEnd(10)}${s.locatorName.padEnd(11)}${s.valid ? 'Active' : 'Invalid'}`);
+          }
+          return true;
+        }
+        if (sub2 === 'state') {
+          const srv6State = window.RouterSrv6.getSrv6State(router.id);
+          io.println(`SRv6 Enabled: ${srv6State.srv6Enabled ? 'Yes' : 'No'}`);
+          io.println('Encapsulation source address: ::');
+          return true;
+        }
+        io.println(`% Unknown: show srv6 ${parts[2] || ''}`);
+        return true;
+      }
+
+      // show route table srv6.inet6.3
+      if (sub === 'route' && (parts[2] || '').toLowerCase() === 'table' && (parts[3] || '').toLowerCase() === 'srv6.inet6.3') {
+        if (!window.RouterSrv6) { io.println('% SRv6 not initialized'); return true; }
+        const entries = window.RouterSrv6.getFwdTable(router.id);
+        io.println(`srv6.inet6.3: ${entries.length} destinations, ${entries.length} routes (${entries.length} active, 0 holddown, 0 hidden)`);
+        io.println('+ = Active Route, - = Last Active, * = Both');
+        io.println('');
+        for (const e of entries) {
+          const prefix = `${e.locatorPrefix}/${e.prefixLen}`;
+          io.println(`${prefix.toUpperCase().padEnd(20)}  *[SRv6/9] 00:01:00`);
+          io.println(`                     > to ${e.nexthopIp.toUpperCase()} via ${e.iface}`);
+        }
+        if (entries.length === 0) io.println('  (no SRv6 forwarding entries)');
+        return true;
+      }
+
       if (sub === 'ipv6') {
         if (!window.RouterIpv6) { io.println('% IPv6 not initialized'); return true; }
         const Ipv6 = window.RouterIpv6;
@@ -1501,7 +1646,20 @@
     });
   }
 
+  // SRv6 パーサ登録
+  if (window.RouterSrv6) {
+    window.RouterSrv6.registerOsParser('junos', {
+      getSrv6Config,
+      getInterfaceList(cfg) {
+        return getInterfaces(cfg).map(f => ({ name: f.name, ip: f.ip, mask: f.mask }));
+      },
+    });
+  }
+
   global.RouterJunos = { handleCommand, complete, restoreBgpSessions };
+
+  // restoreAll に SRv6 を追加
+  setTimeout(() => { if (window.RouterSrv6) window.RouterSrv6.restoreAll(); }, 0);
 
   // IPv6 パーサ登録
   if (window.RouterIpv6) {

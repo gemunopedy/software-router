@@ -626,9 +626,66 @@
   };
 
   showHandlers['segment-routing'] = (args, router, io) => {
+    const sub = _ex(args[0] || '', ['mpls', 'srv6']);
+    if (sub === 'srv6') {
+      if (!window.RouterSrv6) { io.println('% SRv6 not initialized'); return; }
+      const sub2 = _ex(args[1] || 'state', ['state', 'sid', 'forwarding', 'locator']);
+      if (sub2 === 'state') {
+        const srv6State = window.RouterSrv6.getSrv6State(router.id);
+        io.println('Segment Routing over IPv6 (SRv6)');
+        io.println(`  State: ${srv6State.srv6Enabled ? 'Enabled' : 'Disabled'}`);
+        io.println('  Source Address: ::');
+        return;
+      }
+      if (sub2 === 'sid') {
+        const locs = window.RouterSrv6.getLocators(router.id);
+        const sids = window.RouterSrv6.getSidDb(router.id);
+        if (locs.length === 0) { io.println('  (SRv6 not configured)'); return; }
+        const igpType = window.RouterSrv6.getSrv6State(router.id).igpType || '-';
+        for (const loc of locs) {
+          io.println(`*** Locator: '${loc.name}' ***`);
+          io.println('SID                         Behavior  Context    Owner   State');
+          for (const s of sids.filter(e => e.locatorName === loc.name)) {
+            const ctx = `'${loc.name}'`.padEnd(11);
+            io.println(`${s.sid.padEnd(28)}${s.behavior.padEnd(10)}${ctx}${igpType.toUpperCase().padEnd(8)}${s.valid ? 'InUse' : 'Invalid'}`);
+          }
+        }
+        return;
+      }
+      if (sub2 === 'forwarding') {
+        const entries = window.RouterSrv6.getFwdTable(router.id);
+        io.println(`SRv6 Forwarding Table - ${entries.length} entries`);
+        io.println('Locator Prefix          SID                   Next-Hop              Interface');
+        if (entries.length === 0) { io.println('  (empty)'); return; }
+        for (const e of entries) {
+          const sidEntry = window.RouterSrv6.getSidDb().find(s => s.routerId === e.destRouterId);
+          const sidStr = sidEntry ? sidEntry.sid : '-';
+          const prefix = `${e.locatorPrefix}/${e.prefixLen}`;
+          io.println(`${prefix.padEnd(24)}${sidStr.padEnd(22)}${e.nexthopIp.padEnd(22)}${e.iface}`);
+        }
+        return;
+      }
+      if (sub2 === 'locator') {
+        const locName = args[2];
+        const detail = (args[3] || '').toLowerCase() === 'detail';
+        const locs = window.RouterSrv6.getLocators(router.id);
+        const filtered = locName ? locs.filter(l => l.name === locName) : locs;
+        if (filtered.length === 0) { io.println(`% Locator ${locName || ''} not found`); return; }
+        for (const loc of filtered) {
+          io.println(`Locator: ${loc.name}`);
+          io.println(`  Prefix: ${loc.prefix}/${loc.prefixLen}`);
+          io.println('  Status: Up');
+          if (detail) {
+            const sids = window.RouterSrv6.getSidDb(router.id).filter(e => e.locatorName === loc.name);
+            for (const s of sids) io.println(`  SID: ${s.sid} (${s.behavior})`);
+          }
+        }
+        return;
+      }
+      io.println(`% Invalid input after 'show segment-routing srv6'`);
+      return;
+    }
     if (!window.RouterSr) { io.println('% Segment Routing not initialized'); return; }
-    const sub = _ex(args[0] || 'mpls', ['mpls']);
-    if (sub !== 'mpls') { io.println(`% Invalid input after 'show segment-routing'`); return; }
     const sub2 = _ex(args[1] || 'lb', ['lb','connected-prefix-sid-map','forwarding']);
     if (sub2 === 'lb') {
       const blk = window.RouterSr.getSrLabelBlock(router.id);
@@ -897,6 +954,85 @@
     }
     return null;
   }
+  // --- SRv6 設定パーサ ---
+  function getSrv6Config(cfg) {
+    const lines = (cfg || '').split('\n');
+    let srv6Enabled = false;
+    let igpType = null;
+    const locators = [];
+
+    let inSrv6 = false, inLocators = false, inLocator = false, curLocName = null;
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (/^segment-routing\s+srv6\s*$/i.test(t)) {
+        srv6Enabled = true; inSrv6 = true; inLocators = false; inLocator = false; curLocName = null;
+        continue;
+      }
+      if (inSrv6) {
+        if (t !== '' && !/^[ \t]/.test(t)) { inSrv6 = false; inLocators = false; inLocator = false; continue; }
+        const trimmed = t.trim();
+        if (trimmed === 'locators') { inLocators = true; inLocator = false; curLocName = null; continue; }
+        if (inLocators) {
+          const locM = trimmed.match(/^locator\s+(\S+)$/i);
+          if (locM) { curLocName = locM[1]; inLocator = true; continue; }
+          if (inLocator) {
+            const prefM = trimmed.match(/^prefix\s+([\w:]+)\/([\d]+)/i);
+            if (prefM) locators.push({ name: curLocName, prefix: prefM[1], prefixLen: parseInt(prefM[2]) });
+          }
+        }
+      }
+    }
+
+    // ISIS/OSPF での SRv6 利用を検出
+    let inIsis = false, inOspf = false;
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (/^router\s+isis/i.test(t)) { inIsis = true; inOspf = false; continue; }
+      if (/^router\s+ospf/i.test(t)) { inOspf = true; inIsis = false; continue; }
+      if (/^[^ \t!]/.test(t) && t !== '') { inIsis = false; inOspf = false; continue; }
+      if (inIsis && /^\s+segment-routing\s+srv6\b/i.test(t)) igpType = 'isis';
+      if (inOspf && /^\s+segment-routing\s+srv6\b/i.test(t)) igpType = 'ospf';
+    }
+
+    if (!srv6Enabled) return null;
+    return { srv6Enabled, igpType, locators };
+  }
+
+  // segment-routing srv6 ブロックを running config から除去する
+  function _removeSrv6Block(cfg) {
+    const lines = (cfg || '').split('\n');
+    const out = [];
+    let skip = false;
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (/^segment-routing\s+srv6\s*$/i.test(t)) { skip = true; continue; }
+      if (skip) {
+        if (t === '' || /^[ \t]/.test(t)) continue;
+        skip = false;
+      }
+      out.push(raw);
+    }
+    return out.join('\n');
+  }
+
+  // ロケーター一覧を running config に書き込む（既存ブロックを置換）
+  function _writeSrv6LocatorsToConfig(router, locators) {
+    let cfg = Storage.read(router.id, 'running') || '';
+    cfg = _removeSrv6Block(cfg);
+    if (locators.length === 0) {
+      Storage.write(router.id, 'running', cfg);
+      return;
+    }
+    let block = 'segment-routing srv6\n locators\n';
+    for (const loc of locators) {
+      block += `  locator ${loc.name}\n`;
+      if (loc.prefix !== undefined && loc.prefixLen !== undefined) {
+        block += `   prefix ${loc.prefix}/${loc.prefixLen}\n`;
+      }
+    }
+    Storage.write(router.id, 'running', cfg.trimEnd() + '\n' + block);
+  }
+
   function getSrConfig(cfg) {
     const srEnabled = /^segment-routing\s+mpls\s*$/im.test(cfg || '');
     if (!srEnabled) return null;
@@ -1266,7 +1402,14 @@
         return true;
       }
       if (verb === 'exit') {
-        if (state.configMode === 'if' || state.configMode === 'router' || state.configMode === 'vrf-def') {
+        if (state.configMode === 'srv6-loc') {
+          state.configMode = 'srv6-locs';
+          state.configSrv6LocatorName = null;
+        } else if (state.configMode === 'srv6-locs') {
+          state.configMode = 'srv6';
+        } else if (state.configMode === 'srv6') {
+          state.configMode = 'global';
+        } else if (state.configMode === 'if' || state.configMode === 'router' || state.configMode === 'vrf-def') {
           state.configMode = 'global';
           state.configIface = null;
           state.configRouter = null;
@@ -1465,6 +1608,63 @@
         }
 
         io.println(`% Invalid input in config-if mode: ${parts.join(' ')}`);
+        return true;
+      }
+
+      // ---------- config-srv6 モード ----------
+      if (state.configMode === 'srv6') {
+        if (verb === 'locators') {
+          state.configMode = 'srv6-locs';
+          return true;
+        }
+        io.println(`% Invalid input in config-srv6: ${parts.join(' ')}`);
+        return true;
+      }
+
+      // ---------- config-srv6-locs モード ----------
+      if (state.configMode === 'srv6-locs') {
+        if (verb === 'locator') {
+          const name = parts[1];
+          if (!name) { io.println('% Incomplete: locator name required'); return true; }
+          // 既存ロケーターになければ追加
+          const existing = getSrv6Config(Storage.read(router.id, 'running') || '');
+          const locs = existing ? existing.locators : [];
+          if (!locs.find(l => l.name === name)) {
+            locs.push({ name });
+            _writeSrv6LocatorsToConfig(router, locs);
+          }
+          state.configSrv6LocatorName = name;
+          state.configMode = 'srv6-loc';
+          return true;
+        }
+        io.println(`% Invalid input in config-srv6-locators: ${parts.join(' ')}`);
+        return true;
+      }
+
+      // ---------- config-srv6-loc モード ----------
+      if (state.configMode === 'srv6-loc') {
+        const locName = state.configSrv6LocatorName;
+        if (verb === 'prefix') {
+          const cidr = parts[1];
+          if (!cidr || !cidr.includes('/')) { io.println('% Usage: prefix <prefix>/<len>'); return true; }
+          const [prefix, lenStr] = cidr.split('/');
+          const prefixLen = parseInt(lenStr);
+          const existing = getSrv6Config(Storage.read(router.id, 'running') || '');
+          const locs = existing ? existing.locators.filter(l => l.name !== locName) : [];
+          locs.push({ name: locName, prefix, prefixLen });
+          _writeSrv6LocatorsToConfig(router, locs);
+          if (window.RouterSrv6) window.RouterSrv6.recalculate();
+          return true;
+        }
+        if (verb === 'no' && _ex(parts[1], ['prefix']) === 'prefix') {
+          const existing = getSrv6Config(Storage.read(router.id, 'running') || '');
+          const locs = existing ? existing.locators.filter(l => l.name !== locName) : [];
+          locs.push({ name: locName });
+          _writeSrv6LocatorsToConfig(router, locs);
+          if (window.RouterSrv6) window.RouterSrv6.recalculate();
+          return true;
+        }
+        io.println(`% Invalid input in config-srv6-locator: ${parts.join(' ')}`);
         return true;
       }
 
@@ -1878,6 +2078,24 @@
         const cfg2 = Storage.read(router.id, 'running') || '';
         Storage.write(router.id, 'running', cfg2.replace(/^mpls ldp router-id\s+\S+.*\n?/im, ''));
         if (window.RouterMpls) window.RouterMpls.recalculate(router.id);
+        return true;
+      }
+
+      // segment-routing srv6
+      if (verb === 'segment-routing' && (parts[1] || '').toLowerCase() === 'srv6') {
+        const cfg2 = Storage.read(router.id, 'running') || '';
+        if (!/^segment-routing\s+srv6\s*$/im.test(cfg2)) {
+          Storage.write(router.id, 'running', cfg2.trimEnd() + '\nsegment-routing srv6\n');
+        }
+        state.configMode = 'srv6';
+        if (window.RouterSrv6) window.RouterSrv6.recalculate();
+        return true;
+      }
+      // no segment-routing srv6
+      if (verb === 'no' && _ex(parts[1], ['segment-routing']) === 'segment-routing' && (parts[2] || '').toLowerCase() === 'srv6') {
+        const cfg2 = Storage.read(router.id, 'running') || '';
+        Storage.write(router.id, 'running', _removeSrv6Block(cfg2));
+        if (window.RouterSrv6) window.RouterSrv6.recalculate();
         return true;
       }
 
@@ -2409,8 +2627,22 @@
     });
   }
 
-  // すべての OS パーサが登録されたあとに IS-IS / OSPF / MPLS / SR ルートを復元する
-  setTimeout(() => { RouterIsis.restoreAll(); RouterOspf.restoreAll(); if (window.RouterMpls) window.RouterMpls.restoreAll(); if (window.RouterSr) window.RouterSr.restoreAll(); }, 0);
+  // SRv6 パーサ登録
+  if (window.RouterSrv6) {
+    window.RouterSrv6.registerOsParser('ios-xe', {
+      getSrv6Config,
+      getInterfaceList(cfg) {
+        return parseInterfaces(cfg).map(blk => ({
+          name: blk.name,
+          ip: getIfaceIp(blk),
+          mask: getIfaceMask(blk),
+        })).filter(f => f.ip);
+      },
+    });
+  }
+
+  // すべての OS パーサが登録されたあとに IS-IS / OSPF / MPLS / SR / SRv6 ルートを復元する
+  setTimeout(() => { RouterIsis.restoreAll(); RouterOspf.restoreAll(); if (window.RouterMpls) window.RouterMpls.restoreAll(); if (window.RouterSr) window.RouterSr.restoreAll(); if (window.RouterSrv6) window.RouterSrv6.restoreAll(); }, 0);
 
   // IPv6 パーサ登録
   if (window.RouterIpv6) {
