@@ -995,7 +995,7 @@
       if (sub === 'memory' || sub === 'mem' || verb === 'wr') {
         Storage.write(router.id, 'startup', Storage.read(router.id, 'running'));
         io.println('Building configuration...');
-        io.println('[ok] startup-config を更新しました。');
+        io.println('[OK]');
         return true;
       }
       io.println(`% Invalid input after 'write ${sub}'`);
@@ -1010,7 +1010,7 @@
         Storage.write(router.id, 'startup', Storage.read(router.id, 'running'));
         io.println('Destination filename [startup-config]? ');
         io.println('Building configuration...');
-        io.println('[ok]');
+        io.println('[OK]');
         return true;
       }
       io.println(`% copy ${src} ${dst} is not supported in emulation`);

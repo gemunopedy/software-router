@@ -234,7 +234,8 @@
 
     if (raw === 'write memory' || raw === 'wr' || raw === 'copy running-config startup-config') {
       Storage.write(router.id, 'startup', Storage.read(router.id, 'running'));
-      io.println(`[ok] startup-config を更新しました (${router.id})`);
+      io.println('Building configuration...');
+      io.println('[OK]');
       return;
     }
 

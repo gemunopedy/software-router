@@ -636,7 +636,8 @@
       const sub = (parts[1] || 'memory').toLowerCase();
       if (sub === 'memory' || sub === 'mem' || verb === 'wr') {
         Storage.write(router.id, 'startup', Storage.read(router.id, 'running'));
-        io.println('Building configuration...[OK]');
+        io.println('Building configuration...');
+        io.println('[OK]');
         return true;
       }
       return true;
