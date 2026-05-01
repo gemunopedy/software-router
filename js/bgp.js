@@ -217,6 +217,17 @@
     });
     emit2(ackPkt, senderRouterId, senderIface, receiverRouterId, receiverIface);
 
+    // TCP sequence tracking (SYN counts as 1 byte)
+    let sSeq = senderIsn + 1;
+    let rSeq = serverIsn + 1;
+    // ETH(14) + IP(20) + TCP(20) = 54; payload = pkt.length - 54
+    const _plen = pkt => pkt.length - 54;
+    const _mkAck = (fIp, tIp, fMac, tMac, fPort, tPort, seq, ackNum) =>
+      Packets.buildPacket({
+        proto: 'tcp', src: fIp, dst: tIp, srcMac: fMac, dstMac: tMac,
+        sport: fPort, dport: tPort, flags: ['ack'], seq, ack: ackNum,
+      });
+
     // BGP OPEN 交換（各 OS のパーサで AS/RouterID を取得）
     const scfg = Storage.read(senderRouterId, 'running') || Storage.read(senderRouterId, 'startup') || '';
     const sAs  = sParser.getBgpAs(scfg);
@@ -229,35 +240,47 @@
       src: senderIp, dst: receiverIp, srcMac: senderMac, dstMac: receiverMac,
       sport: senderSport, dport: BGP_PORT,
       as: sAs, hold: 180, bgpId: sRid,
-      seq: senderIsn + 1, ack: serverIsn + 1,
+      seq: sSeq, ack: rSeq,
     });
     emit2(openS, senderRouterId, senderIface, receiverRouterId, receiverIface);
+    sSeq += _plen(openS);
+    emit2(_mkAck(receiverIp, senderIp, receiverMac, senderMac, BGP_PORT, senderSport, rSeq, sSeq),
+          senderRouterId, senderIface, receiverRouterId, receiverIface);
 
     const openR = Packets.buildPacket({
       proto: 'bgp', bgpType: 'open',
       src: receiverIp, dst: senderIp, srcMac: receiverMac, dstMac: senderMac,
       sport: BGP_PORT, dport: senderSport,
       as: rAs, hold: 180, bgpId: rRid,
-      seq: serverIsn + 1, ack: senderIsn + 1,
+      seq: rSeq, ack: sSeq,
     });
     emit2(openR, senderRouterId, senderIface, receiverRouterId, receiverIface);
+    rSeq += _plen(openR);
+    emit2(_mkAck(senderIp, receiverIp, senderMac, receiverMac, senderSport, BGP_PORT, sSeq, rSeq),
+          senderRouterId, senderIface, receiverRouterId, receiverIface);
 
     // KEEPALIVE 交換
     const kaS = Packets.buildPacket({
       proto: 'bgp', bgpType: 'keepalive',
       src: senderIp, dst: receiverIp, srcMac: senderMac, dstMac: receiverMac,
       sport: senderSport, dport: BGP_PORT,
-      seq: senderIsn + 1, ack: serverIsn + 1,
+      seq: sSeq, ack: rSeq,
     });
     emit2(kaS, senderRouterId, senderIface, receiverRouterId, receiverIface);
+    sSeq += _plen(kaS);
+    emit2(_mkAck(receiverIp, senderIp, receiverMac, senderMac, BGP_PORT, senderSport, rSeq, sSeq),
+          senderRouterId, senderIface, receiverRouterId, receiverIface);
 
     const kaR = Packets.buildPacket({
       proto: 'bgp', bgpType: 'keepalive',
       src: receiverIp, dst: senderIp, srcMac: receiverMac, dstMac: senderMac,
       sport: BGP_PORT, dport: senderSport,
-      seq: serverIsn + 1, ack: senderIsn + 1,
+      seq: rSeq, ack: sSeq,
     });
     emit2(kaR, senderRouterId, senderIface, receiverRouterId, receiverIface);
+    rSeq += _plen(kaR);
+    emit2(_mkAck(senderIp, receiverIp, senderMac, receiverMac, senderSport, BGP_PORT, sSeq, rSeq),
+          senderRouterId, senderIface, receiverRouterId, receiverIface);
 
     io.println(`%BGP-5-OPEN: OPEN Message received from ${receiverIp}: AS ${rAs}, Hold Time 180, BGP Router-ID ${rRid}`);
     io.println(`%BGP-5-OPEN: OPEN Message sent to ${receiverIp}: AS ${sAs}, Hold Time 180, BGP Router-ID ${sRid}`);
@@ -311,8 +334,12 @@
         src: senderIp, dst: receiverIp, srcMac: senderMac, dstMac: receiverMac,
         sport: senderSport, dport: BGP_PORT,
         nlri: sNetworks, nextHop: senderIp, asPath: [sAs], origin: 0,
+        seq: sSeq, ack: rSeq,
       });
       emit2(updS, senderRouterId, senderIface, receiverRouterId, receiverIface);
+      sSeq += _plen(updS);
+      emit2(_mkAck(receiverIp, senderIp, receiverMac, senderMac, BGP_PORT, senderSport, rSeq, sSeq),
+            senderRouterId, senderIface, receiverRouterId, receiverIface);
       _installRoutes(receiverRouterId, sNetworks, senderIp, [sAs], senderIp);
       _installRoutes(senderRouterId, sNetworks, '0.0.0.0', [], 'self');
     }
@@ -322,8 +349,12 @@
         src: receiverIp, dst: senderIp, srcMac: receiverMac, dstMac: senderMac,
         sport: BGP_PORT, dport: senderSport,
         nlri: rNetworks, nextHop: receiverIp, asPath: [rAs], origin: 0,
+        seq: rSeq, ack: sSeq,
       });
       emit2(updR, senderRouterId, senderIface, receiverRouterId, receiverIface);
+      rSeq += _plen(updR);
+      emit2(_mkAck(senderIp, receiverIp, senderMac, receiverMac, senderSport, BGP_PORT, sSeq, rSeq),
+            senderRouterId, senderIface, receiverRouterId, receiverIface);
       _installRoutes(senderRouterId, rNetworks, receiverIp, [rAs], receiverIp);
       _installRoutes(receiverRouterId, rNetworks, '0.0.0.0', [], 'self');
     }
@@ -387,6 +418,7 @@
     const ownerCfg = (() => {
       const topo = global.TOPOLOGY;
       if (!topo) return null;
+      // 1) config から neighbor IP を持つルータを探す
       for (const node of topo.nodes) {
         const c = Storage.read(node.id, 'running') || Storage.read(node.id, 'startup') || '';
         const ownerParser = _getParser(node.id);
@@ -394,6 +426,13 @@
         const ownerIfaces = ownerParser.getInterfaceList(c);
         const matched = ownerIfaces.find(f => f.ip === neighborIp);
         if (matched) return { routerId: node.id, iface: matched.name };
+      }
+      // 2) フォールバック: topology link で送信元に直接接続している隣接ノードを使う（擬似挙動）
+      if (Array.isArray(topo.links)) {
+        for (const link of topo.links) {
+          if (link.a === router.id) return { routerId: link.b, iface: link.bPort || null };
+          if (link.b === router.id) return { routerId: link.a, iface: link.aPort || null };
+        }
       }
       return null;
     })();
@@ -486,6 +525,84 @@
 
   // ---- セッション復元（ページリロード後） ----
 
+  // JSON.parse 後の MAC（plain object）を Uint8Array に変換
+  function _toU8Mac(m) {
+    if (m instanceof Uint8Array) return m;
+    // JSON化で {0:2,1:0,...} になった場合
+    const keys = Object.keys(m).map(Number).sort((a,b)=>a-b);
+    return Uint8Array.from(keys.map(k => m[k]));
+  }
+
+  // ページリロード後にセッション復元した際、pcap に 3-way ハンドシェイク + OPEN/KA を再記録する。
+  // capture-view は pcap-store から読み込むため、再記録することで SYN 等が表示される。
+  function _replayHandshakeToPcap(info) {
+    const Pcap = global.RouterPcap;
+    if (!Pcap || !Packets) return;
+    const BGP_PORT = 179;
+    const sMac = _toU8Mac(info.senderMac);
+    const rMac = _toU8Mac(info.receiverMac);
+    const { senderRouterId, senderIface, senderIp, senderSport,
+            receiverRouterId, receiverIface, receiverIp, senderAs, receiverAs } = info;
+
+    function pcap2(pkt) {
+      Pcap.append(senderRouterId, pkt);
+      Pcap.append(receiverRouterId, pkt);
+      // 既に開いている capture view にもリアルタイムで反映
+      if (Capture) {
+        Capture.emit(senderRouterId, pkt, { iface: senderIface });
+        Capture.emit(receiverRouterId, pkt, { iface: receiverIface });
+      }
+    }
+
+    const isn = 1000, serverIsn = 2000;
+    // 3-way handshake
+    pcap2(Packets.buildPacket({ proto: 'tcp', src: senderIp, dst: receiverIp, srcMac: sMac, dstMac: rMac,
+      sport: senderSport, dport: BGP_PORT, flags: ['syn'], seq: isn, ack: 0 }));
+    pcap2(Packets.buildPacket({ proto: 'tcp', src: receiverIp, dst: senderIp, srcMac: rMac, dstMac: sMac,
+      sport: BGP_PORT, dport: senderSport, flags: ['syn', 'ack'], seq: serverIsn, ack: isn + 1 }));
+    pcap2(Packets.buildPacket({ proto: 'tcp', src: senderIp, dst: receiverIp, srcMac: sMac, dstMac: rMac,
+      sport: senderSport, dport: BGP_PORT, flags: ['ack'], seq: isn + 1, ack: serverIsn + 1 }));
+
+    const scfg = Storage.read(senderRouterId, 'running') || Storage.read(senderRouterId, 'startup') || '';
+    const rcfg = Storage.read(receiverRouterId, 'running') || Storage.read(receiverRouterId, 'startup') || '';
+    const sParser = _getParser(senderRouterId), rParser = _getParser(receiverRouterId);
+    const sAs = (sParser && sParser.getBgpAs(scfg)) || senderAs || 65000;
+    const rAs = (rParser && rParser.getBgpAs(rcfg)) || receiverAs || 65000;
+    const sRid = (sParser && sParser.getBgpRouterId(scfg)) || senderIp;
+    const rRid = (rParser && rParser.getBgpRouterId(rcfg)) || receiverIp;
+
+    let sSeq = isn + 1, rSeq = serverIsn + 1;
+    const _p = pkt => pkt.length - 54;
+
+    const openS = Packets.buildPacket({ proto: 'bgp', bgpType: 'open',
+      src: senderIp, dst: receiverIp, srcMac: sMac, dstMac: rMac,
+      sport: senderSport, dport: BGP_PORT, as: sAs, hold: 180, bgpId: sRid, seq: sSeq, ack: rSeq });
+    pcap2(openS); sSeq += _p(openS);
+    pcap2(Packets.buildPacket({ proto: 'tcp', src: receiverIp, dst: senderIp, srcMac: rMac, dstMac: sMac,
+      sport: BGP_PORT, dport: senderSport, flags: ['ack'], seq: rSeq, ack: sSeq }));
+
+    const openR = Packets.buildPacket({ proto: 'bgp', bgpType: 'open',
+      src: receiverIp, dst: senderIp, srcMac: rMac, dstMac: sMac,
+      sport: BGP_PORT, dport: senderSport, as: rAs, hold: 180, bgpId: rRid, seq: rSeq, ack: sSeq });
+    pcap2(openR); rSeq += _p(openR);
+    pcap2(Packets.buildPacket({ proto: 'tcp', src: senderIp, dst: receiverIp, srcMac: sMac, dstMac: rMac,
+      sport: senderSport, dport: BGP_PORT, flags: ['ack'], seq: sSeq, ack: rSeq }));
+
+    const kaS = Packets.buildPacket({ proto: 'bgp', bgpType: 'keepalive',
+      src: senderIp, dst: receiverIp, srcMac: sMac, dstMac: rMac,
+      sport: senderSport, dport: BGP_PORT, seq: sSeq, ack: rSeq });
+    pcap2(kaS); sSeq += _p(kaS);
+    pcap2(Packets.buildPacket({ proto: 'tcp', src: receiverIp, dst: senderIp, srcMac: rMac, dstMac: sMac,
+      sport: BGP_PORT, dport: senderSport, flags: ['ack'], seq: rSeq, ack: sSeq }));
+
+    const kaR = Packets.buildPacket({ proto: 'bgp', bgpType: 'keepalive',
+      src: receiverIp, dst: senderIp, srcMac: rMac, dstMac: sMac,
+      sport: BGP_PORT, dport: senderSport, seq: rSeq, ack: sSeq });
+    pcap2(kaR); rSeq += _p(kaR);
+    pcap2(Packets.buildPacket({ proto: 'tcp', src: senderIp, dst: receiverIp, srcMac: sMac, dstMac: rMac,
+      sport: senderSport, dport: BGP_PORT, flags: ['ack'], seq: sSeq, ack: rSeq }));
+  }
+
   function _restoreSessions(router) {
     const cfg = Storage.read(router.id, 'running') || '';
     const parser = _getParser(router.id);
@@ -516,6 +633,12 @@
           _bgpEstablished.set(tk, true);
           // keepaliveTimer は再起動しない（Hold Timer タイムアウトなし・pcap ノイズ回避）
           _bgpSessionInfo.set(tk, { ...info, keepaliveTimer: null });
+          // オリジネータ側（senderSport が非 179）かつ未 replay の場合のみ pcap に再記録
+          if (info.senderSport !== 179 && !info.replayed) {
+            _replayHandshakeToPcap(info);
+            const updated = { ...info, replayed: true };
+            try { localStorage.setItem(_sessKey(tk), JSON.stringify(updated)); } catch (_) {}
+          }
           continue;
         } catch (_) {}
       }

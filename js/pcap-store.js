@@ -120,5 +120,24 @@
     list().forEach(n => clear(n));
   }
 
-  global.RouterPcap = { append, list, size, count, download, clear };
+  // pcap バイナリを解析して個別パケットを返す
+  function getPackets(name) {
+    const data = read(name);
+    if (!data || data.length < 24) return [];
+    const dv = new DataView(data.buffer);
+    const out = [];
+    let off = 24; // global header skip
+    while (off + 16 <= data.length) {
+      const sec    = dv.getUint32(off,     true);
+      const usec   = dv.getUint32(off + 4, true);
+      const caplen = dv.getUint32(off + 8, true);
+      off += 16;
+      if (off + caplen > data.length) break;
+      out.push({ ts: sec * 1000 + Math.floor(usec / 1000), bytes: data.slice(off, off + caplen) });
+      off += caplen;
+    }
+    return out;
+  }
+
+  global.RouterPcap = { append, list, size, count, download, clear, getPackets };
 })(window);

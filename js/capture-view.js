@@ -454,7 +454,16 @@
     // 保存済みパケットを復元（自動スクロールは復元時は OFF）
     const _prev = autoscroll.checked;
     autoscroll.checked = false;
-    _loadPackets().forEach(d => append(d.bytes, d.ts, d.iface));
+    // pcap-store にデータがあればそちらを優先して全履歴を復元、なければ JSON ストアから
+    const Pcap = global.RouterPcap;
+    const pcapHistory = (Pcap && opts.routerId) ? Pcap.getPackets(opts.routerId) : [];
+    if (pcapHistory.length > 0) {
+      // virt_router:capture の iface 情報を ts+length でマージ
+      const ifaceMap = new Map(_loadPackets().map(d => [`${d.ts}:${d.bytes.length}`, d.iface]));
+      pcapHistory.forEach(d => append(d.bytes, d.ts, ifaceMap.get(`${d.ts}:${d.bytes.length}`) || null));
+    } else {
+      _loadPackets().forEach(d => append(d.bytes, d.ts, d.iface));
+    }
     autoscroll.checked = _prev;
 
     return { append, destroy };
