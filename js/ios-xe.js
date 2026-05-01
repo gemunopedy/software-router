@@ -228,7 +228,7 @@
 
   // show ip interface brief
   showHandlers['ip'] = (args, router, io) => {
-    const sub = _ex(args[0], ['interface','route','bgp']);
+    const sub = _ex(args[0], ['interface','route','bgp','ospf']);
     const cfg = readCfg(router);
 
     if (sub === 'interface' && (args[1] || '').match(/^br/i)) {
@@ -271,7 +271,7 @@
 
     if (sub === 'route') {
       // show ip route – AD選択ベース
-      io.println('Codes: C - connected, S - static, R - RIP, I - ISIS, B - BGP');
+      io.println('Codes: C - connected, S - static, R - RIP, I - ISIS, O - OSPF, B - BGP');
       io.println('       D - EIGRP, EX - EIGRP external, O - OSPF, ...');
       io.println('');
       io.println('Gateway of last resort is not set');
@@ -294,6 +294,9 @@
       RouterIsis.getRib(router.id).forEach(e => {
         candidates.push({ type: 'I', prefix: e.prefix, prefixLen: e.prefixLen, ad: 115, metric: e.metric, nexthop: e.nexthop, level: e.level });
       });
+      RouterOspf.getRib(router.id).forEach(e => {
+        candidates.push({ type: 'O', prefix: e.prefix, prefixLen: e.prefixLen, ad: RouterRib.AD.O, metric: e.metric, nexthop: e.nexthop });
+      });
       RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self').forEach(e => {
         candidates.push({ type: 'B', prefix: e.prefix, prefixLen: e.prefixLen, ad: 20, metric: 0, nexthop: e.nextHop });
       });
@@ -303,6 +306,7 @@
         else if (r.type === 'L') io.println(`L     ${r.prefix}/${r.prefixLen} is directly connected, ${r.via}`);
         else if (r.type === 'S') io.println(`S     ${r.prefix}/${r.prefixLen} [${r.ad}/0] via ${r.nexthop}`);
         else if (r.type === 'I') io.println(`I L${r.level}  ${r.prefix}/${r.prefixLen} [115/${r.metric}] via ${r.nexthop}`);
+        else if (r.type === 'O') io.println(`O     ${r.prefix}/${r.prefixLen} [110/${r.metric}] via ${r.nexthop}`);
         else if (r.type === 'B') io.println(`B     ${r.prefix}/${r.prefixLen} [20/0] via ${r.nexthop}, 00:00:00`);
       });
       return;
@@ -310,6 +314,11 @@
 
     if (sub === 'bgp') {
       showIpBgp(args.slice(1), router, cfg, io);
+      return;
+    }
+
+    if (sub === 'ospf') {
+      _showOspf(args.slice(1), router, io);
       return;
     }
 
@@ -389,13 +398,45 @@
     });
   };
 
-  // show ospf (簡易プレースホルダ)
-  showHandlers['ospf'] = (args, router, io) => {
-    io.println(' Routing Process "ospf 1" with ID 0.0.0.0');
-    io.println(' Start time: 00:00:00.000, Time elapsed: 00:00:00.000');
-    io.println(' Supports only single TOS(TOS0) routes');
-    io.println(' (emulated - no real OSPF process running)');
-  };
+  // show ip ospf / show ospf
+  function _showOspf(args, router, io) {
+    const cfg = readCfg(router);
+    const procM = cfg.match(/^router\s+ospf\s+(\S+)/im);
+    const proc = procM ? procM[1] : '1';
+    const ridM = cfg.match(/^\s+router-id\s+([\d.]+)/im);
+    const rid = ridM ? ridM[1] : router.id;
+    const sub = _ex(args[0] || 'neighbor', ['neighbor','database']);
+
+    if (sub === 'neighbor') {
+      const neighbors = RouterOspf.getNeighbors(router.id);
+      io.println('Neighbor ID     Pri   State           Dead Time   Address         Interface');
+      if (neighbors.length === 0) io.println(' (no OSPF neighbors)');
+      neighbors.forEach(n => {
+        io.println(
+          `${n.routerId.padEnd(16)}1   FULL/DR         00:00:35    ${n.routerIp.padEnd(16)}${n.ifaceName}`
+        );
+      });
+    } else if (sub === 'database') {
+      const db = RouterOspf.getDatabase(router.id);
+      io.println('');
+      io.println(`            OSPF Router with ID (${rid}) (Process ID ${proc})`);
+      io.println('');
+      io.println('                Router Link States (Area 0.0.0.0)');
+      io.println('');
+      io.println('Link ID         ADV Router      Age         Seq#       Checksum Link count');
+      db.forEach(e => {
+        io.println(
+          `${e.lsId.padEnd(16)}${e.routerId.padEnd(16)}${String(e.age).padEnd(12)}${e.seq.padEnd(11)}${e.checksum.padEnd(9)}${e.linkCount}`
+        );
+      });
+    } else {
+      io.println(` Routing Process "ospf ${proc}" with ID ${rid}`);
+      io.println(' Start time: 00:00:00.000, Time elapsed: 00:00:00.000');
+      io.println(' Supports only single TOS(TOS0) routes');
+    }
+  }
+
+  showHandlers['ospf'] = (args, router, io) => _showOspf(args, router, io);
 
   // show clock
   showHandlers['clock'] = (args, router, io) => {
@@ -896,6 +937,34 @@
           return true;
         }
 
+        // ip ospf <pid> area <area>
+        if (verb === 'ip' && /^ospf$/i.test(parts[1] || '')) {
+          if (/^cost$/i.test(parts[2] || '')) {
+            const val = parts[3];
+            if (!val || isNaN(+val)) { io.println('% Incomplete command.'); return true; }
+            _updateIfaceLine(router, ifaceName, /^ip ospf cost\s+/i, `ip ospf cost ${val}`);
+            RouterOspf.recalculate(router.id);
+            return true;
+          }
+          const pid = parts[2];
+          const areaIdx = parts.findIndex(p => /^area$/i.test(p));
+          const area = areaIdx >= 0 ? parts[areaIdx + 1] : null;
+          if (!pid || !area) { io.println('% Incomplete command.'); return true; }
+          _updateIfaceLine(router, ifaceName, new RegExp(`^ip ospf\\s+${pid}\\s+area\\s+`, 'i'), `ip ospf ${pid} area ${area}`);
+          RouterOspf.recalculate(router.id);
+          return true;
+        }
+        // no ip ospf ...
+        if (verb === 'no' && /^ip$/i.test(parts[1] || '') && /^ospf$/i.test(parts[2] || '')) {
+          if (/^cost$/i.test(parts[3] || '')) {
+            _removeIfaceLine(router, ifaceName, /^ip ospf cost\s+/i);
+          } else {
+            _removeIfaceLine(router, ifaceName, /^ip ospf\s+\d+\s+area\s+/i);
+          }
+          RouterOspf.recalculate(router.id);
+          return true;
+        }
+
         io.println(`% Invalid input in config-if mode: ${parts.join(' ')}`);
         return true;
       }
@@ -903,6 +972,41 @@
       // ---------- config-router モード ----------
       if (state.configMode === 'router') {
         const procKey = state.configRouter; // e.g. 'bgp 65001' or 'isis CORE'
+
+        // OSPF router mode
+        if ((procKey || '').toLowerCase().startsWith('ospf')) {
+          if (verb === 'network') {
+            const ip = parts[1], wildcard = parts[2];
+            const areaIdx = parts.findIndex(p => /^area$/i.test(p));
+            const area = areaIdx >= 0 ? parts[areaIdx + 1] : null;
+            if (!ip || !wildcard || !area) { io.println('% Incomplete command.'); return true; }
+            _updateRouterLine(router, procKey, new RegExp(`^network\\s+${ip.replace(/\./g,'\\.')}\\s+${wildcard.replace(/\./g,'\\.')}\\s+area\\s+`, 'i'), `network ${ip} ${wildcard} area ${area}`);
+            RouterOspf.recalculate(router.id);
+            return true;
+          }
+          if (verb === 'no') {
+            const sub2 = _ex(parts[1], ['network','router-id']);
+            if (sub2 === 'network') {
+              const ip = parts[2], wildcard = parts[3];
+              if (!ip || !wildcard) { io.println('% Incomplete command.'); return true; }
+              _removeRouterLine(router, procKey, new RegExp(`^network\\s+${ip.replace(/\./g,'\\.')}\\s+${wildcard.replace(/\./g,'\\.')}\\s+area\\s+`, 'i'));
+              RouterOspf.recalculate(router.id);
+              return true;
+            }
+            if (sub2 === 'router-id') {
+              _removeRouterLine(router, procKey, /^router-id\s+/i);
+              return true;
+            }
+          }
+          if (verb === 'router-id') {
+            const rid = parts[1];
+            if (!rid) { io.println('% Incomplete command.'); return true; }
+            _updateRouterLine(router, procKey, /^router-id\s+/i, `router-id ${rid}`);
+            return true;
+          }
+          io.println(`% Invalid input in config-router-ospf: ${parts.join(' ')}`);
+          return true;
+        }
 
         // IS-IS router mode
         if ((procKey || '').toLowerCase().startsWith('isis')) {
@@ -1031,7 +1135,7 @@
       }
 
       // router bgp <as-number>
-      if (verb === 'router' && _ex(parts[1], ['bgp','isis']) === 'bgp') {
+      if (verb === 'router' && _ex(parts[1], ['bgp','isis','ospf']) === 'bgp') {
         const asn = parts[2];
         if (!asn || isNaN(+asn)) { io.println('% Incomplete command: specify AS number.'); return true; }
         const procKey = `bgp ${asn}`;
@@ -1047,7 +1151,7 @@
       }
 
       // router isis [PROCESS]
-      if (verb === 'router' && _ex(parts[1], ['bgp','isis']) === 'isis') {
+      if (verb === 'router' && _ex(parts[1], ['bgp','isis','ospf']) === 'isis') {
         const proc = parts[2] || 'default';
         const procKey = `isis ${proc}`;
         const cfg = Storage.read(router.id, 'running') || '';
@@ -1059,8 +1163,22 @@
         return true;
       }
 
+      // router ospf <pid>
+      if (verb === 'router' && _ex(parts[1], ['bgp','isis','ospf']) === 'ospf') {
+        const pid = parts[2];
+        if (!pid) { io.println('% Incomplete command: specify process ID.'); return true; }
+        const procKey = `ospf ${pid}`;
+        const cfg = Storage.read(router.id, 'running') || '';
+        if (!new RegExp(`^router\\s+ospf\\s+${pid}\\s*$`, 'im').test(cfg)) {
+          Storage.write(router.id, 'running', cfg.trimEnd() + `\nrouter ospf ${pid}\n`);
+        }
+        state.configMode = 'router';
+        state.configRouter = procKey;
+        return true;
+      }
+
       // no router bgp <as-number>
-      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'router' && _ex(parts[2], ['bgp','isis']) === 'bgp') {
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'router' && _ex(parts[2], ['bgp','isis','ospf']) === 'bgp') {
         const asn = parts[3];
         if (!asn) { io.println('% Incomplete command.'); return true; }
         _removeRouterBlock(router, `bgp ${asn}`);
@@ -1068,11 +1186,20 @@
       }
 
       // no router isis [PROCESS]
-      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'router' && _ex(parts[2], ['bgp','isis']) === 'isis') {
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'router' && _ex(parts[2], ['bgp','isis','ospf']) === 'isis') {
         const proc = parts[3];
         if (!proc) { io.println('% Incomplete command.'); return true; }
         _removeRouterBlock(router, `isis ${proc}`);
         RouterIsis.recalculate(router.id);
+        return true;
+      }
+
+      // no router ospf <pid>
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'router' && _ex(parts[2], ['bgp','isis','ospf']) === 'ospf') {
+        const pid = parts[3];
+        if (!pid) { io.println('% Incomplete command.'); return true; }
+        _removeRouterBlock(router, `ospf ${pid}`);
+        RouterOspf.recalculate(router.id);
         return true;
       }
 
@@ -1237,9 +1364,9 @@
       }
       const v = before[0];
       if (v === 'ip' && before.length === 1)
-        return ['address'].filter(s => s.startsWith(last.toLowerCase()));
+        return ['address', 'ospf', 'router'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'no' && before.length === 1)
-        return ['ip', 'description', 'shutdown'].filter(s => s.startsWith(last.toLowerCase()));
+        return ['ip', 'description', 'shutdown', 'isis'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'no' && before[1] === 'ip' && before.length === 2)
         return ['address'].filter(s => s.startsWith(last.toLowerCase()));
       return [];
@@ -1255,18 +1382,27 @@
       if ((v === 'interface' || v === 'int') && before.length === 1)
         return ifaceNames().filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
       if (v === 'router' && before.length === 1)
-        return ['bgp', 'isis'].filter(s => s.startsWith(last.toLowerCase()));
+        return ['bgp', 'isis', 'ospf'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'no' && before.length === 1)
         return ['interface', 'router'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'no' && (before[1] === 'interface' || before[1] === 'int') && before.length === 2)
         return ifaceNames().filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
       if (v === 'no' && before[1] === 'router' && before.length === 2)
-        return ['bgp', 'isis'].filter(s => s.startsWith(last.toLowerCase()));
+        return ['bgp', 'isis', 'ospf'].filter(s => s.startsWith(last.toLowerCase()));
       return [];
     }
 
     if (mode === 'router') {
       // config-router モード
+      const procKey = state && state.configRouter || '';
+      if (procKey.startsWith('ospf')) {
+        if (before.length === 0)
+          return ['network', 'router-id', 'no', 'exit', 'end'].filter(c => c.startsWith(last.toLowerCase()));
+        const v = before[0];
+        if (v === 'network' && before.length === 3) return ['area'].filter(s => s.startsWith(last.toLowerCase()));
+        if (v === 'no' && before.length === 1) return ['network', 'router-id'].filter(s => s.startsWith(last.toLowerCase()));
+        return [];
+      }
       if (before.length === 0) {
         return ['neighbor', 'network', 'bgp', 'no', 'exit', 'end']
           .filter(c => c.startsWith(last.toLowerCase()));
@@ -1331,7 +1467,7 @@
       }
       if (sub === 'ip') {
         if (before.length === 2) {
-          return ['interface', 'route', 'bgp'].filter(s => s.startsWith(last.toLowerCase()));
+          return ['interface', 'route', 'bgp', 'ospf'].filter(s => s.startsWith(last.toLowerCase()));
         }
         if (before[2] === 'interface' && before.length === 3) {
           return ['brief', ...ifaceNames()].filter(s => s.toLowerCase().startsWith(last.toLowerCase()));
@@ -1473,8 +1609,89 @@
     },
   });
 
-  // すべての OS パーサが登録されたあとに IS-IS ルートを復元する
-  setTimeout(() => RouterIsis.restoreAll(), 0);
+  // OSPF パーサ登録
+  RouterOspf.registerOsParser('ios-xe', {
+    getOspfConfig(cfg) {
+      const ifBlocks = parseInterfaces(cfg);
+      const areas = {};
+      let hasPerId = false;
+
+      // Per-interface style: ip ospf <pid> area <area>
+      ifBlocks.forEach(blk => {
+        const ospfLine = blk.lines.find(l => /^ip\s+ospf\s+\d+\s+area\s+/i.test(l));
+        if (!ospfLine) return;
+        hasPerId = true;
+        const m = ospfLine.match(/^ip\s+ospf\s+\d+\s+area\s+(\S+)/i);
+        if (!m) return;
+        const area = m[1];
+        if (!areas[area]) areas[area] = { interfaces: [] };
+        const costLine = blk.lines.find(l => /^ip\s+ospf\s+cost\s+/i.test(l));
+        const cost = costLine ? (parseInt((costLine.match(/cost\s+(\d+)/i) || [])[1]) || 1) : 1;
+        areas[area].interfaces.push({ name: blk.name, cost, passive: false });
+      });
+
+      const ospfM = cfg.match(/^router\s+ospf\s+(\d+)/im);
+      const process = ospfM ? ospfM[1] : '1';
+
+      if (hasPerId) {
+        if (!Object.keys(areas).length) return null;
+        const ridM = cfg.match(/^\s+router-id\s+([\d.]+)/im);
+        return { process, routerId: ridM ? ridM[1] : null, areas };
+      }
+
+      // Network statement style
+      if (!ospfM) return null;
+      const lines = cfg.split('\n');
+      const headerRe = new RegExp(`^router\\s+ospf\\s+${process}\\s*$`, 'im');
+      let inBlock = false, routerId = null;
+      const networks = [];
+
+      for (const raw of lines) {
+        const t = raw.trimEnd();
+        if (headerRe.test(t)) { inBlock = true; continue; }
+        if (inBlock) {
+          if (t !== '' && !/^[ \t]/.test(t)) { inBlock = false; continue; }
+          const nm = t.trim().match(/^network\s+([\d.]+)\s+([\d.]+)\s+area\s+(\S+)/i);
+          if (nm) networks.push({ ip: nm[1], wildcard: nm[2], area: nm[3] });
+          const rm = t.trim().match(/^router-id\s+([\d.]+)/i);
+          if (rm) routerId = rm[1];
+        }
+      }
+      if (!networks.length) return null;
+
+      // Match interfaces against network statements
+      const toInt = s => s.split('.').reduce((a, b) => ((a * 256) + parseInt(b)) >>> 0, 0);
+      ifBlocks.forEach(blk => {
+        const ipInfo = getIfIp(blk);
+        if (!ipInfo) return;
+        for (const net of networks) {
+          const wldN = toInt(net.wildcard);
+          const mask = (~wldN) >>> 0;
+          if ((toInt(ipInfo.ip) & mask) === (toInt(net.ip) & mask)) {
+            const area = net.area;
+            if (!areas[area]) areas[area] = { interfaces: [] };
+            const costLine = blk.lines.find(l => /^ip\s+ospf\s+cost\s+/i.test(l));
+            const cost = costLine ? (parseInt((costLine.match(/cost\s+(\d+)/i) || [])[1]) || 1) : 1;
+            areas[area].interfaces.push({ name: blk.name, cost, passive: false });
+            break;
+          }
+        }
+      });
+
+      if (!Object.keys(areas).length) return null;
+      return { process, routerId, areas };
+    },
+    getInterfaceList(cfg) {
+      return parseInterfaces(cfg).map(blk => ({
+        name: blk.name,
+        ip: getIfaceIp(blk),
+        mask: getIfaceMask(blk),
+      })).filter(f => f.ip);
+    },
+  });
+
+  // すべての OS パーサが登録されたあとに IS-IS / OSPF ルートを復元する
+  setTimeout(() => { RouterIsis.restoreAll(); RouterOspf.restoreAll(); }, 0);
 
   global.RouterIosXe = { handleCommand, complete, restoreBgpSessions };
 })(window);

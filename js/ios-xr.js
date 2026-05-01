@@ -286,6 +286,155 @@
     if (global.RouterCapture) global.RouterCapture.emit(router.id, pkt, { iface: ifaceName });
   }
 
+  // ---- OSPF ブロック操作 ----
+
+  function _ifaceMatchLocal(a, b) {
+    const norm = s => (s || '').toLowerCase()
+      .replace(/^gigabitethernet/i, 'gi')
+      .replace(/^loopback/i, 'lo')
+      .replace(/\.0$/, '');
+    const an = norm(a), bn = norm(b);
+    return an === bn || an.startsWith(bn) || bn.startsWith(an);
+  }
+
+  function _parseOspfStruct(cfg, proc) {
+    const headerRe = new RegExp(`^router\\s+ospf\\s+${proc.replace(/[-/]/g,'[-\\/]')}\\s*$`, 'i');
+    const lines = (cfg || '').split('\n');
+    const result = { routerId: null, areas: {} };
+    let inBlock = false, curArea = null, curIface = null;
+
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { inBlock = true; continue; }
+      if (!inBlock) continue;
+      if (t !== '' && !/^[ \t!]/.test(t)) break;
+      const indent = t.length - t.trimStart().length;
+      const trimmed = t.trim();
+      if (!trimmed || trimmed === '!') { if (indent <= 1) curIface = null; continue; }
+
+      if (indent <= 1) {
+        curIface = null;
+        const ridM = trimmed.match(/^router-id\s+([\d.]+)/i);
+        if (ridM) { result.routerId = ridM[1]; curArea = null; continue; }
+        const areaM = trimmed.match(/^area\s+(\S+)/i);
+        if (areaM) { curArea = areaM[1]; if (!result.areas[curArea]) result.areas[curArea] = []; continue; }
+        curArea = null;
+      } else if (indent === 2 && curArea !== null) {
+        const ifM = trimmed.match(/^interface\s+(\S+)/i);
+        if (ifM) { curIface = { name: ifM[1], props: [] }; result.areas[curArea].push(curIface); continue; }
+        curIface = null;
+      } else if (indent >= 3 && curIface !== null) {
+        curIface.props.push(trimmed);
+      }
+    }
+    return result;
+  }
+
+  function _serializeOspfStruct(proc, parsed) {
+    const lines = [`router ospf ${proc}`];
+    if (parsed.routerId) lines.push(` router-id ${parsed.routerId}`);
+    for (const [areaId, ifaces] of Object.entries(parsed.areas)) {
+      lines.push(` area ${areaId}`);
+      for (const iface of ifaces) {
+        lines.push(`  interface ${iface.name}`);
+        for (const prop of iface.props) lines.push(`   ${prop}`);
+      }
+    }
+    return lines.join('\n');
+  }
+
+  function _writeOspfStruct(router, proc, parsed) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^router\\s+ospf\\s+${proc.replace(/[-/]/g,'[-\\/]')}\\s*$`, 'i');
+    let skip = false;
+    const remaining = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { skip = true; return false; }
+      if (skip) {
+        if (t !== '' && !/^[ \t!]/.test(t)) { skip = false; return true; }
+        return false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', remaining.join('\n').trimEnd() + '\n' + _serializeOspfStruct(proc, parsed) + '\n');
+  }
+
+  function _removeOspfBlock(router, proc) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^router\\s+ospf\\s+${proc.replace(/[-/]/g,'[-\\/]')}\\s*$`, 'i');
+    let skip = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { skip = true; return false; }
+      if (skip) {
+        if (t !== '' && !/^[ \t!]/.test(t)) { skip = false; return true; }
+        return false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  function _setOspfRouterId(router, proc, rid) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const parsed = _parseOspfStruct(cfg, proc);
+    parsed.routerId = rid || null;
+    _writeOspfStruct(router, proc, parsed);
+  }
+
+  function _ensureOspfArea(router, proc, areaId) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const parsed = _parseOspfStruct(cfg, proc);
+    if (!parsed.areas[areaId]) { parsed.areas[areaId] = []; _writeOspfStruct(router, proc, parsed); }
+  }
+
+  function _removeOspfArea(router, proc, areaId) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const parsed = _parseOspfStruct(cfg, proc);
+    delete parsed.areas[areaId];
+    _writeOspfStruct(router, proc, parsed);
+  }
+
+  function _ensureOspfAreaIface(router, proc, areaId, ifaceName) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const parsed = _parseOspfStruct(cfg, proc);
+    if (!parsed.areas[areaId]) parsed.areas[areaId] = [];
+    if (!parsed.areas[areaId].find(i => _ifaceMatchLocal(i.name, ifaceName))) {
+      parsed.areas[areaId].push({ name: ifaceName, props: [] });
+      _writeOspfStruct(router, proc, parsed);
+    }
+  }
+
+  function _removeOspfAreaIface(router, proc, areaId, ifaceName) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const parsed = _parseOspfStruct(cfg, proc);
+    if (parsed.areas[areaId]) {
+      parsed.areas[areaId] = parsed.areas[areaId].filter(i => !_ifaceMatchLocal(i.name, ifaceName));
+      if (!parsed.areas[areaId].length) delete parsed.areas[areaId];
+    }
+    _writeOspfStruct(router, proc, parsed);
+  }
+
+  function _setOspfAreaIfProp(router, proc, areaId, ifaceName, propRe, propStr) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const parsed = _parseOspfStruct(cfg, proc);
+    if (!parsed.areas[areaId]) parsed.areas[areaId] = [];
+    let iface = parsed.areas[areaId].find(i => _ifaceMatchLocal(i.name, ifaceName));
+    if (!iface) { iface = { name: ifaceName, props: [] }; parsed.areas[areaId].push(iface); }
+    if (propRe) {
+      const idx = iface.props.findIndex(p => propRe.test(p));
+      if (idx >= 0) {
+        if (propStr) iface.props[idx] = propStr;
+        else iface.props.splice(idx, 1);
+      } else if (propStr) {
+        iface.props.push(propStr);
+      }
+    } else if (propStr) {
+      iface.props.push(propStr);
+    }
+    _writeOspfStruct(router, proc, parsed);
+  }
+
   // ---- IS-IS ブロック操作 (IOS-XR: インタフェースはブロック内の1行) ----
 
   function _updateIsisLine(router, procKey, matchRe, newLine) {
@@ -529,7 +678,7 @@
 
   showHandlers['route'] = (args, router, io) => {
     const cfg = Storage.read(router.id, 'running') || Storage.read(router.id, 'startup') || '';
-    io.println('Codes: C - connected, L - local, S - static, i - ISIS, B - BGP');
+    io.println('Codes: C - connected, L - local, S - static, i - ISIS, O - OSPF, B - BGP');
     io.println('');
 
     const candidates = [];
@@ -550,6 +699,9 @@
     RouterIsis.getRib(router.id).forEach(e => {
       candidates.push({ type: 'I', prefix: e.prefix, prefixLen: e.prefixLen, ad: 115, metric: e.metric, nexthop: e.nexthop, level: e.level });
     });
+    RouterOspf.getRib(router.id).forEach(e => {
+      candidates.push({ type: 'O', prefix: e.prefix, prefixLen: e.prefixLen, ad: RouterRib.AD.O, metric: e.metric, nexthop: e.nexthop });
+    });
     RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self').forEach(e => {
       candidates.push({ type: 'B', prefix: e.prefix, prefixLen: e.prefixLen, ad: 20, metric: 0, nexthop: e.nextHop });
     });
@@ -559,6 +711,7 @@
       else if (r.type === 'L') io.println(`L     ${r.prefix}/${r.prefixLen} is directly connected, ${r.via}`);
       else if (r.type === 'S') io.println(`S     ${r.prefix}/${r.prefixLen} [${r.ad}/0] via ${r.nexthop}`);
       else if (r.type === 'I') io.println(`i L${r.level}  ${r.prefix}/${r.prefixLen} [115/${r.metric}] via ${r.nexthop}`);
+      else if (r.type === 'O') io.println(`O     ${r.prefix}/${r.prefixLen} [110/${r.metric}] via ${r.nexthop}`);
       else if (r.type === 'B') io.println(`B     ${r.prefix}/${r.prefixLen} [20/0] via ${r.nexthop}`);
     });
   };
@@ -582,6 +735,39 @@
         const age = Math.floor((Date.now() - e.ts) / 60000);
         io.println(`${e.ip.padEnd(17)}${String(age).padEnd(11)}${macHex.padEnd(16)}Dynamic    ARPA  ${e.iface || '-'}`);
       });
+    }
+  };
+
+  showHandlers['ospf'] = (args, router, io) => {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const procM = cfg.match(/^router\s+ospf\s+(\S+)/im);
+    const proc = procM ? procM[1] : '1';
+    const sub = _ex(args[0] || 'neighbor', ['neighbor','database']);
+
+    if (sub === 'neighbor') {
+      const neighbors = RouterOspf.getNeighbors(router.id);
+      io.println('* Indicates MADJ interface');
+      io.println(`Neighbors for OSPF ${proc}`);
+      io.println('');
+      io.println('Neighbor ID     Pri   State           Dead Time   Address         Interface');
+      if (neighbors.length === 0) io.println(' (no OSPF neighbors)');
+      neighbors.forEach(n => {
+        io.println(`${n.routerId.padEnd(16)}1   FULL/DR         00:00:37    ${n.routerIp.padEnd(16)}${n.ifaceName}`);
+      });
+      io.println('');
+      io.println(`Total neighbor count: ${neighbors.length}`);
+    } else if (sub === 'database') {
+      const db = RouterOspf.getDatabase(router.id);
+      io.println(`OSPF Router with ID (${router.id}) (Process ID ${proc})`);
+      io.println('');
+      io.println('            Router Link States (Area 0.0.0.0)');
+      io.println('');
+      io.println('Link ID         ADV Router      Age  Seq#         Checksum Link count');
+      db.forEach(e => {
+        io.println(`${e.lsId.padEnd(16)}${e.routerId.padEnd(16)}${String(e.age).padEnd(5)}${e.seq.padEnd(13)}${e.checksum.padEnd(9)}${e.linkCount}`);
+      });
+    } else {
+      io.println(`% Unknown 'show ospf ${args[0]}'`);
     }
   };
 
@@ -618,6 +804,9 @@
   const _SCANDS = ['address-family','do','end','exit','no'];
   const _ISCANDS = ['address-family','end','exit','interface','is-type','net','no'];
   const _ISIFCANDS = ['address-family','end','exit','metric','no','passive','point-to-point'];
+  const _OSPFCANDS = ['area','end','exit','no','router-id'];
+  const _OSPFAREACANDS = ['end','exit','interface','no'];
+  const _OSPFIFCANDS = ['cost','end','exit','network','no','passive'];
 
   function handleCommand(parts, state, io) {
     const router = state.router;
@@ -626,6 +815,9 @@
                   : state.configMode === 'static' ? _SCANDS
                   : state.configMode === 'isis' ? _ISCANDS
                   : state.configMode === 'isis-if' ? _ISIFCANDS
+                  : state.configMode === 'ospf' ? _OSPFCANDS
+                  : state.configMode === 'ospf-area' ? _OSPFAREACANDS
+                  : state.configMode === 'ospf-if' ? _OSPFIFCANDS
                   : state.configMode ? _CCANDS
                   : _ECANDS;
     const verb = _ex(parts[0], _vcands);
@@ -634,11 +826,18 @@
       if (verb === 'end') {
         state.configMode = null; state.configIface = null; state.configRouter = null;
         state.configIsisProcess = null; state.configIsisIface = null;
+        state.configOspfProcess = null; state.configOspfArea = null; state.configOspfIface = null;
         return true;
       }
       if (verb === 'exit') {
         if (state.configMode === 'isis-if') {
           state.configMode = 'isis'; state.configIsisIface = null;
+        } else if (state.configMode === 'ospf-if') {
+          state.configMode = 'ospf-area'; state.configOspfIface = null;
+        } else if (state.configMode === 'ospf-area') {
+          state.configMode = 'ospf'; state.configOspfArea = null;
+        } else if (state.configMode === 'ospf') {
+          state.configMode = 'global'; state.configOspfProcess = null;
         } else if (state.configMode === 'if' || state.configMode === 'router' || state.configMode === 'static' || state.configMode === 'isis') {
           state.configMode = 'global'; state.configIface = null; state.configRouter = null;
           state.configIsisProcess = null; state.configIsisIface = null;
@@ -871,6 +1070,96 @@
         return true;
       }
 
+      // ---------- config-ospf ----------
+      if (state.configMode === 'ospf') {
+        const proc = state.configOspfProcess;
+        if (verb === 'router-id') {
+          const rid = parts[1];
+          if (!rid) { io.println('% Incomplete'); return true; }
+          _setOspfRouterId(router, proc, rid);
+          return true;
+        }
+        if (verb === 'area') {
+          const areaId = parts[1];
+          if (!areaId) { io.println('% Incomplete'); return true; }
+          _ensureOspfArea(router, proc, areaId);
+          state.configMode = 'ospf-area';
+          state.configOspfArea = areaId;
+          return true;
+        }
+        if (verb === 'no') {
+          const sub2 = _ex(parts[1], ['router-id','area']);
+          if (sub2 === 'router-id') { _setOspfRouterId(router, proc, null); return true; }
+          if (sub2 === 'area') {
+            const areaId = parts[2];
+            if (!areaId) { io.println('% Incomplete'); return true; }
+            _removeOspfArea(router, proc, areaId);
+            RouterOspf.recalculate(router.id);
+            return true;
+          }
+        }
+        io.println(`% Invalid input in config-ospf: ${parts.join(' ')}`);
+        return true;
+      }
+
+      // ---------- config-ospf-area ----------
+      if (state.configMode === 'ospf-area') {
+        const proc = state.configOspfProcess;
+        const areaId = state.configOspfArea;
+        if (verb === 'interface') {
+          const name = parts[1];
+          if (!name) { io.println('% Incomplete'); return true; }
+          _ensureOspfAreaIface(router, proc, areaId, name);
+          state.configMode = 'ospf-if';
+          state.configOspfIface = name;
+          return true;
+        }
+        if (verb === 'no') {
+          const sub2 = _ex(parts[1], ['interface']);
+          if (sub2 === 'interface') {
+            const name = parts[2];
+            if (!name) { io.println('% Incomplete'); return true; }
+            _removeOspfAreaIface(router, proc, areaId, name);
+            RouterOspf.recalculate(router.id);
+            return true;
+          }
+        }
+        io.println(`% Invalid input in config-ospf-area: ${parts.join(' ')}`);
+        return true;
+      }
+
+      // ---------- config-ospf-if ----------
+      if (state.configMode === 'ospf-if') {
+        const proc = state.configOspfProcess;
+        const areaId = state.configOspfArea;
+        const ifName = state.configOspfIface;
+        if (verb === 'cost') {
+          const val = parts[1];
+          if (!val || isNaN(+val)) { io.println('% Incomplete: cost value required'); return true; }
+          _setOspfAreaIfProp(router, proc, areaId, ifName, /\bcost\s+\d+/i, `cost ${val}`);
+          RouterOspf.recalculate(router.id);
+          return true;
+        }
+        if (verb === 'passive') {
+          _setOspfAreaIfProp(router, proc, areaId, ifName, /\bpassive\b/i, 'passive');
+          RouterOspf.recalculate(router.id);
+          return true;
+        }
+        if (verb === 'network') {
+          _setOspfAreaIfProp(router, proc, areaId, ifName, /\bpoint-to-point\b/i, 'point-to-point');
+          RouterOspf.recalculate(router.id);
+          return true;
+        }
+        if (verb === 'no') {
+          const sub2 = _ex(parts[1], ['cost','passive','network']);
+          if (sub2 === 'cost') { _setOspfAreaIfProp(router, proc, areaId, ifName, /\bcost\s+\d+/i, null); RouterOspf.recalculate(router.id); return true; }
+          if (sub2 === 'passive') { _setOspfAreaIfProp(router, proc, areaId, ifName, /\bpassive\b/i, null); RouterOspf.recalculate(router.id); return true; }
+          if (sub2 === 'network') { _setOspfAreaIfProp(router, proc, areaId, ifName, /\bpoint-to-point\b/i, null); RouterOspf.recalculate(router.id); return true; }
+        }
+        io.println(`% Invalid input in config-ospf-if: ${parts.join(' ')}`);
+        return true;
+      }
+
       // ---------- global config ----------
 
       // interface <name>
@@ -887,7 +1176,7 @@
       }
 
       // router bgp <asn>
-      if (verb === 'router' && _ex(parts[1], ['bgp','static','isis']) === 'bgp') {
+      if (verb === 'router' && _ex(parts[1], ['bgp','static','isis','ospf']) === 'bgp') {
         const asn = parts[2];
         if (!asn || isNaN(+asn)) { io.println('% Specify AS number.'); return true; }
         const procKey = `bgp ${asn}`;
@@ -901,7 +1190,7 @@
       }
 
       // router static
-      if (verb === 'router' && _ex(parts[1], ['bgp','static','isis']) === 'static') {
+      if (verb === 'router' && _ex(parts[1], ['bgp','static','isis','ospf']) === 'static') {
         const cfg = Storage.read(router.id, 'running') || '';
         if (!/^router\s+static\s*$/im.test(cfg)) {
           Storage.write(router.id, 'running', cfg.trimEnd() + '\nrouter static\n  address-family ipv4 unicast\n');
@@ -911,7 +1200,7 @@
       }
 
       // router isis <PROCESS>
-      if (verb === 'router' && _ex(parts[1], ['bgp','static','isis']) === 'isis') {
+      if (verb === 'router' && _ex(parts[1], ['bgp','static','isis','ospf']) === 'isis') {
         const proc = parts[2] || 'default';
         const cfg = Storage.read(router.id, 'running') || '';
         if (!new RegExp(`^router\\s+isis\\s+${proc}\\s*$`, 'im').test(cfg)) {
@@ -931,11 +1220,32 @@
       }
 
       // no router isis <PROCESS>
-      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname']) === 'router' && _ex(parts[2], ['bgp','isis']) === 'isis') {
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname']) === 'router' && _ex(parts[2], ['bgp','isis','ospf']) === 'isis') {
         const proc = parts[3];
         if (!proc) { io.println('% Incomplete command.'); return true; }
         _removeIsisBlock(router, proc);
         RouterIsis.recalculate(router.id);
+        return true;
+      }
+
+      // router ospf <name>
+      if (verb === 'router' && _ex(parts[1], ['bgp','static','isis','ospf']) === 'ospf') {
+        const proc = parts[2] || '1';
+        const cfg = Storage.read(router.id, 'running') || '';
+        if (!new RegExp(`^router\\s+ospf\\s+${proc.replace(/[-/]/g,'[-\\/]')}\\s*$`, 'im').test(cfg)) {
+          Storage.write(router.id, 'running', cfg.trimEnd() + `\nrouter ospf ${proc}\n`);
+        }
+        state.configMode = 'ospf';
+        state.configOspfProcess = proc;
+        return true;
+      }
+
+      // no router ospf <name>
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname']) === 'router' && _ex(parts[2], ['bgp','isis','ospf']) === 'ospf') {
+        const proc = parts[3];
+        if (!proc) { io.println('% Incomplete command.'); return true; }
+        _removeOspfBlock(router, proc);
+        RouterOspf.recalculate(router.id);
         return true;
       }
 
@@ -979,7 +1289,7 @@
     }
 
     if (verb === 'show' || verb === 'sh') {
-      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','interfaces','ip','bgp','route','arp','isis'];
+      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','interfaces','ip','bgp','route','arp','isis','ospf'];
       const sub = _ex(parts[1], _SHOW_KEYS);
       if (!sub) { io.println('% Incomplete command.'); return true; }
       const handler = showHandlers[sub];
@@ -1027,8 +1337,9 @@
       if (before.length === 0) return ['interface','hostname','router','no','exit','end'].filter(c => c.startsWith(last.toLowerCase()));
       const v = before[0];
       if ((v === 'interface'||v==='int') && before.length === 1) return ifaceNames().filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
-      if (v === 'router' && before.length === 1) return ['bgp', 'isis'].filter(s => s.startsWith(last.toLowerCase()));
+      if (v === 'router' && before.length === 1) return ['bgp', 'isis', 'ospf'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'no' && before.length === 1) return ['interface','router'].filter(s => s.startsWith(last.toLowerCase()));
+      if (v === 'no' && before[1] === 'router' && before.length === 2) return ['bgp', 'isis', 'ospf'].filter(s => s.startsWith(last.toLowerCase()));
       return [];
     }
 
@@ -1038,6 +1349,29 @@
       if (v === 'bgp' && before.length === 1) return ['router-id'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'neighbor' && before.length === 2) return ['remote-as','update-source','description','shutdown'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'no' && before.length === 1) return ['neighbor','network'].filter(s => s.startsWith(last.toLowerCase()));
+      return [];
+    }
+
+    if (mode === 'ospf') {
+      if (before.length === 0) return ['area','router-id','no','exit','end'].filter(c => c.startsWith(last.toLowerCase()));
+      const v = before[0];
+      if (v === 'no' && before.length === 1) return ['area','router-id'].filter(s => s.startsWith(last.toLowerCase()));
+      return [];
+    }
+
+    if (mode === 'ospf-area') {
+      if (before.length === 0) return ['interface','no','exit','end'].filter(c => c.startsWith(last.toLowerCase()));
+      const v = before[0];
+      if (v === 'interface' && before.length === 1) return ifaceNames().filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
+      if (v === 'no' && before.length === 1) return ['interface'].filter(s => s.startsWith(last.toLowerCase()));
+      return [];
+    }
+
+    if (mode === 'ospf-if') {
+      if (before.length === 0) return ['cost','passive','network','no','exit','end'].filter(c => c.startsWith(last.toLowerCase()));
+      const v = before[0];
+      if (v === 'network' && before.length === 1) return ['point-to-point'].filter(s => s.startsWith(last.toLowerCase()));
+      if (v === 'no' && before.length === 1) return ['cost','passive','network'].filter(s => s.startsWith(last.toLowerCase()));
       return [];
     }
 
@@ -1052,12 +1386,13 @@
     }
     if (verb === 'show' || verb === 'sh') {
       if (before.length === 1) {
-        return ['bgp','route','interfaces','running-config','startup-config','version','arp']
+        return ['bgp','route','interfaces','running-config','startup-config','version','arp','isis','ospf']
           .filter(s => s.startsWith(last.toLowerCase()));
       }
       const sub = before[1];
       if (sub === 'bgp' && before.length === 2) return ['summary'].filter(s => s.startsWith(last.toLowerCase()));
       if (sub === 'interfaces' && before.length === 2) return ['brief',...ifaceNames()].filter(s => s.toLowerCase().startsWith(last.toLowerCase()));
+      if (sub === 'ospf' && before.length === 2) return ['neighbor','database'].filter(s => s.startsWith(last.toLowerCase()));
     }
     if (verb === 'write' || verb === 'wr') {
       if (before.length === 1) return ['memory'].filter(s => s.startsWith(last.toLowerCase()));
@@ -1163,6 +1498,34 @@
       }
       if (!net) return null;
       return { process: procKey, net, isType, interfaces };
+    },
+    getInterfaceList(cfg) {
+      return parseInterfaces(cfg || '').map(blk => {
+        const info = getIfIpInfo(blk);
+        return info ? { name: blk.name, ip: info.ip, mask: info.mask } : null;
+      }).filter(Boolean);
+    },
+  });
+
+  // OSPF パーサ登録
+  RouterOspf.registerOsParser('ios-xr', {
+    getOspfConfig(cfg) {
+      const m = (cfg || '').match(/^router\s+ospf\s+(\S+)/im);
+      if (!m) return null;
+      const proc = m[1];
+      const struct = _parseOspfStruct(cfg || '', proc);
+      const routerId = struct.routerId || null;
+      const areas = {};
+      for (const [areaId, ifaceArr] of Object.entries(struct.areas)) {
+        const ifaces = ifaceArr.map(ifObj => {
+          const propsStr = (ifObj.props || []).join(' ');
+          const passM = /\bpassive\b/.test(propsStr);
+          const costM = propsStr.match(/\bcost\s+(\d+)/i);
+          return { name: ifObj.name, cost: costM ? parseInt(costM[1]) : 1, passive: passM };
+        });
+        areas[areaId] = { interfaces: ifaces };
+      }
+      return { process: proc, routerId, areas };
     },
     getInterfaceList(cfg) {
       return parseInterfaces(cfg || '').map(blk => {

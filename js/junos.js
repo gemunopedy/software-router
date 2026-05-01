@@ -248,6 +248,9 @@
     RouterIsis.getRib(router.id).forEach(e => {
       candidates.push({ type: 'ISIS', prefix: e.prefix, prefixLen: e.prefixLen, ad: 15, metric: e.metric, nexthop: e.nexthop, level: e.level });
     });
+    RouterOspf.getRib(router.id).forEach(e => {
+      candidates.push({ type: 'OSPF', prefix: e.prefix, prefixLen: e.prefixLen, ad: 10, metric: e.metric, nexthop: e.nexthop });
+    });
     RouterBgp.getRib(router.id).filter(e => e.selected && e.neighborIp !== 'self').forEach(e => {
       candidates.push({ type: 'BGP', prefix: e.prefix, prefixLen: e.prefixLen, ad: 20, metric: 0, nexthop: e.nextHop, asPath: e.asPath });
     });
@@ -265,6 +268,9 @@
         io.println(`                    > to ${r.nexthop}`);
       } else if (r.type === 'ISIS') {
         io.println(`${r.prefix}/${r.prefixLen}       *[IS-IS/15] preference 15 metric ${r.metric}`);
+        io.println(`                    > to ${r.nexthop}`);
+      } else if (r.type === 'OSPF') {
+        io.println(`${r.prefix}/${r.prefixLen}       *[OSPF/10] preference 10 metric ${r.metric}`);
         io.println(`                    > to ${r.nexthop}`);
       } else if (r.type === 'BGP') {
         const path = r.asPath ? r.asPath.join(' ') : '';
@@ -322,7 +328,8 @@
     }
     const neighbors = getBgpNeighbors(cfg);
     const networks  = getBgpNetworks(cfg);
-    if (neighbors.length || networks.length) {
+    const ospfCfg = getOspfConfig(cfg);
+    if (neighbors.length || networks.length || ospfCfg) {
       io.println('protocols {');
       io.println('    bgp {');
       // group by groupName
@@ -343,8 +350,63 @@
         io.println(`        }`);
       }
       networks.forEach(n => io.println(`        network ${n.prefix}/${n.prefixLen};`));
-      io.println('    }');
+      if (neighbors.length || networks.length) { io.println('    }'); }
+      if (ospfCfg) {
+        io.println('    ospf {');
+        for (const [areaId, ifArr] of Object.entries(ospfCfg.areas)) {
+          io.println(`        area ${areaId} {`);
+          ifArr.forEach(ifObj => {
+            io.println(`            interface ${ifObj.name} {`);
+            if (ifObj.props) {
+              const metM = ifObj.props.match(/metric\s+(\d+)/i);
+              if (metM) io.println(`                metric ${metM[1]};`);
+              if (/passive/i.test(ifObj.props)) io.println('                passive;');
+            }
+            io.println('            }');
+          });
+          io.println('        }');
+        }
+        io.println('    }');
+      }
       io.println('}');
+    }
+  }
+
+  function getOspfConfig(cfg) {
+    const areas = {};
+    const re = /^set protocols ospf area (\S+) interface (\S+)(.*)?/gim;
+    let m;
+    while ((m = re.exec(cfg || ''))) {
+      const areaId = m[1], ifname = m[2], extra = (m[3] || '').trim();
+      if (!areas[areaId]) areas[areaId] = [];
+      const existing = areas[areaId].find(e => e.name === ifname);
+      if (existing) {
+        if (extra) existing.props = extra;
+      } else {
+        areas[areaId].push({ name: ifname, props: extra });
+      }
+    }
+    if (Object.keys(areas).length === 0) return null;
+    return { areas };
+  }
+
+  function showOspf(args, router, io) {
+    const sub = _ex(args[0] || 'neighbor', ['neighbor','database']);
+    if (sub === 'neighbor') {
+      const neighbors = RouterOspf.getNeighbors(router.id);
+      io.println('OSPF neighbor database:');
+      io.println('Address         Interface      State           ID              Pri  Dead');
+      if (neighbors.length === 0) io.println(' (no OSPF neighbors)');
+      neighbors.forEach(n => {
+        io.println(`${n.neighborIp.padEnd(16)}${(n.ifaceName||'-').padEnd(15)}Full            ${(n.neighborId||n.neighborIp).padEnd(16)}1    39`);
+      });
+    } else if (sub === 'database') {
+      const db = RouterOspf.getDatabase();
+      io.println('OSPF database, Area 0.0.0.0');
+      io.println('Type       ID               Adv Rtr          Seq      Age  Opt  Cksum  Len');
+      db.forEach(e => {
+        io.println(`Router    *${(e.routerId||'-').padEnd(16)} ${(e.routerId||'-').padEnd(16)} 0x8000001  ${e.age||0}  0x22 0x${e.checksum||'0000'}  36`);
+      });
     }
   }
 
@@ -463,6 +525,28 @@
           return true;
         }
       }
+      if (proto === 'ospf') {
+        const ospfRest = rest.slice(1);
+        if ((ospfRest[0] || '').toLowerCase() === 'area') {
+          const areaId = ospfRest[1];
+          if (!areaId) { io.println('% Incomplete: area id required'); return true; }
+          if ((ospfRest[2] || '').toLowerCase() === 'interface') {
+            const ifname = ospfRest[3];
+            if (!ifname) { io.println('% Incomplete: interface name required'); return true; }
+            const props = ospfRest.slice(4).join(' ');
+            if (_setLineMissing(router, `set protocols ospf area ${areaId} interface ${ifname}`)) {
+              _setLine(router, `set protocols ospf area ${areaId} interface ${ifname}`);
+            }
+            if (props) {
+              _deleteLines(router, new RegExp(`^set protocols ospf area ${areaId.replace(/\./g,'\\.')} interface ${ifname.replace(/\//g,'\\/')} (metric|passive)`, 'i'));
+              _setLine(router, `set protocols ospf area ${areaId} interface ${ifname} ${props}`);
+            }
+            RouterOspf.recalculate(router.id);
+            return true;
+          }
+        }
+        return true;
+      }
       if (proto === 'isis') {
         const isisRest = rest.slice(1);
         if ((isisRest[0] || '').toLowerCase() === 'interface') {
@@ -533,6 +617,29 @@
           return true;
         }
       }
+      if (proto === 'ospf') {
+        const ospfRest = rest.slice(1);
+        if ((ospfRest[0] || '').toLowerCase() === 'area') {
+          const areaId = ospfRest[1];
+          if (!areaId) {
+            // delete all OSPF config
+            _deleteLines(router, /^set protocols ospf\s+/i);
+          } else if ((ospfRest[2] || '').toLowerCase() === 'interface') {
+            if (ospfRest[3]) {
+              const ifname = ospfRest[3];
+              _deleteLines(router, new RegExp(`^set protocols ospf area ${areaId.replace(/\./g,'\\.')} interface ${ifname.replace(/\//g,'\\/')}(\\s+.*)?$`, 'i'));
+            } else {
+              _deleteLines(router, new RegExp(`^set protocols ospf area ${areaId.replace(/\./g,'\\.')} interface\\s+`, 'i'));
+            }
+          } else {
+            _deleteLines(router, new RegExp(`^set protocols ospf area ${areaId.replace(/\./g,'\\.')}\\s+`, 'i'));
+          }
+        } else {
+          _deleteLines(router, /^set protocols ospf\s+/i);
+        }
+        RouterOspf.recalculate(router.id);
+        return true;
+      }
       if (proto === 'isis') {
         const isisRest = rest.slice(1);
         if ((isisRest[0] || '').toLowerCase() === 'interface') {
@@ -586,7 +693,7 @@
       if (verb === 'top') { return true; } // already at top
 
       if (verb === 'show') {
-        const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis'];
+        const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf'];
         const sub = _ex(parts[1], _SHOW_J);
         if (!sub || sub === '|' || sub === 'all') { showConfig(router, io); return true; }
         // show interfaces etc. from config mode
@@ -639,7 +746,7 @@
     }
 
     if (verb === 'show') {
-      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis'];
+      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf'];
       const sub = _ex(parts[1], _SHOW_J);
       if (sub === 'interfaces' || sub === 'interface') {
         showInterfaces(parts.slice(2), router, io); return true;
@@ -654,7 +761,6 @@
         showConfig(router, io); return true;
       }
       if (sub === 'running-config') {
-        // support for cross-OS show running-config
         showConfig(router, io); return true;
       }
       if (sub === 'version') {
@@ -703,6 +809,9 @@
           });
         }
         return true;
+      }
+      if (sub === 'ospf') {
+        showOspf(parts.slice(2), router, io); return true;
       }
       io.println(`% Unknown show command: ${sub}`);
       return true;
@@ -764,7 +873,7 @@
         return ['autonomous-system','router-id'].filter(s => s.startsWith(last.toLowerCase()));
       }
       if (v === 'set' && before[1] === 'protocols' && before.length === 2) {
-        return ['bgp'].filter(s => s.startsWith(last.toLowerCase()));
+        return ['bgp','isis','ospf'].filter(s => s.startsWith(last.toLowerCase()));
       }
       if (v === 'set' && before[1] === 'protocols' && before[2] === 'bgp' && before.length === 3) {
         return ['group','network'].filter(s => s.startsWith(last.toLowerCase()));
@@ -787,10 +896,13 @@
     }
     const verb = before[0];
     if (verb === 'show' && before.length === 1) {
-      return ['interfaces','bgp','route','configuration','version','arp'].filter(s => s.startsWith(last.toLowerCase()));
+      return ['interfaces','bgp','route','configuration','version','arp','isis','ospf'].filter(s => s.startsWith(last.toLowerCase()));
     }
     if (verb === 'show' && before[1] === 'bgp' && before.length === 2) {
       return ['summary'].filter(s => s.startsWith(last.toLowerCase()));
+    }
+    if (verb === 'show' && before[1] === 'ospf' && before.length === 2) {
+      return ['neighbor','database'].filter(s => s.startsWith(last.toLowerCase()));
     }
     return [];
   }
@@ -864,6 +976,27 @@
       }
 
       return { process: 'isis', net, isType: 'level-2-only', interfaces };
+    },
+    getInterfaceList(cfg) {
+      return getInterfaces(cfg).map(f => ({ name: f.name, ip: f.ip, mask: f.mask }));
+    },
+  });
+
+  // OSPF パーサ登録
+  RouterOspf.registerOsParser('junos', {
+    getOspfConfig(cfg) {
+      const ospf = getOspfConfig(cfg);
+      if (!ospf) return null;
+      const areas = {};
+      for (const [areaId, ifArr] of Object.entries(ospf.areas)) {
+        const ifaces = ifArr.map(ifObj => {
+          const metM = (ifObj.props || '').match(/metric\s+(\d+)/i);
+          const passive = /passive/i.test(ifObj.props || '');
+          return { name: ifObj.name, cost: metM ? parseInt(metM[1]) : 1, passive };
+        });
+        areas[areaId] = { interfaces: ifaces };
+      }
+      return { process: 'ospf', routerId: null, areas };
     },
     getInterfaceList(cfg) {
       return getInterfaces(cfg).map(f => ({ name: f.name, ip: f.ip, mask: f.mask }));
