@@ -427,6 +427,14 @@
       }
       io.println('}');
     }
+    // class-of-service ブロックを show configuration に追加
+    const cosCfg = RouterQos.parseJunosCoS(cfg);
+    const hasCoS = cosCfg.classifiers.length || cosCfg.schedulers.length || cosCfg.schedulerMaps.length || cosCfg.ifaceSchedulerMaps.length;
+    if (hasCoS) {
+      // set 形式でそのまま出力
+      const cosLines = (cfg || '').split('\n').filter(l => /^set class-of-service\s+/i.test(l.trim()));
+      cosLines.forEach(l => io.println(l));
+    }
   }
 
   function getOspfConfig(cfg) {
@@ -854,11 +862,101 @@
       return true;
     }
 
+    if (cat === 'class-of-service') {
+      return _handleSetCoS(parts, router, io);
+    }
+
     io.println(`% Unknown set path: ${parts.slice(1).join(' ')}`);
     return true;
   }
 
-  function _setLineMissing(router, line) {
+  // ---- class-of-service set/delete ----
+
+  function _handleSetCoS(parts, router, io) {
+    // parts[0]='set', parts[1]='class-of-service', parts[2..]=rest
+    const sub = (parts[2] || '').toLowerCase();
+    const raw = parts.slice(2).join(' ');
+
+    if (sub === 'classifiers') {
+      // set class-of-service classifiers dscp <NAME> forwarding-class <FC> loss-priority <lp> code-points <cp>
+      _deleteLines(router, new RegExp(`^set class-of-service classifiers dscp ${parts[3]} forwarding-class ${parts[5]} loss-priority \\S+ code-points \\S+`, 'i'));
+      _setLine(router, `set class-of-service ${raw}`);
+      return true;
+    }
+    if (sub === 'schedulers') {
+      // set class-of-service schedulers <NAME> transmit-rate <rate>
+      const name = parts[3];
+      if (!name) { io.println('% Incomplete command.'); return true; }
+      if ((parts[4] || '').toLowerCase() === 'transmit-rate' && parts[5]) {
+        _deleteLines(router, new RegExp(`^set class-of-service schedulers ${name} transmit-rate\\s+`, 'i'));
+        _setLine(router, `set class-of-service schedulers ${name} transmit-rate ${parts[5]}`);
+      } else {
+        _setLine(router, `set class-of-service ${raw}`);
+      }
+      return true;
+    }
+    if (sub === 'scheduler-maps') {
+      _setLine(router, `set class-of-service ${raw}`);
+      return true;
+    }
+    if (sub === 'interfaces') {
+      const iface = parts[3];
+      if (!iface) { io.println('% Incomplete command.'); return true; }
+      if ((parts[4] || '').toLowerCase() === 'scheduler-map' && parts[5]) {
+        _deleteLines(router, new RegExp(`^set class-of-service interfaces ${iface.replace(/\//g,'\\/')} scheduler-map\\s+`, 'i'));
+        _setLine(router, `set class-of-service interfaces ${iface} scheduler-map ${parts[5]}`);
+      } else {
+        _setLine(router, `set class-of-service ${raw}`);
+      }
+      return true;
+    }
+    io.println(`% Unknown class-of-service sub-command: ${sub}`);
+    return true;
+  }
+
+  function _handleDeleteCoS(parts, router, io) {
+    // parts[0]='delete', parts[1]='class-of-service', parts[2..]=rest
+    const sub = (parts[2] || '').toLowerCase();
+
+    if (sub === 'classifiers') {
+      const name = parts[4]; // dscp <NAME>
+      if (name) {
+        _deleteLines(router, new RegExp(`^set class-of-service classifiers dscp ${name}\\s+`, 'i'));
+      } else {
+        _deleteLines(router, /^set class-of-service classifiers\s+/i);
+      }
+      return true;
+    }
+    if (sub === 'schedulers') {
+      const name = parts[3];
+      if (name) {
+        _deleteLines(router, new RegExp(`^set class-of-service schedulers ${name}\\s+`, 'i'));
+      } else {
+        _deleteLines(router, /^set class-of-service schedulers\s+/i);
+      }
+      return true;
+    }
+    if (sub === 'scheduler-maps') {
+      const name = parts[3];
+      if (name) {
+        _deleteLines(router, new RegExp(`^set class-of-service scheduler-maps ${name}\\s+`, 'i'));
+      } else {
+        _deleteLines(router, /^set class-of-service scheduler-maps\s+/i);
+      }
+      return true;
+    }
+    if (sub === 'interfaces') {
+      const iface = parts[3];
+      if (iface) {
+        _deleteLines(router, new RegExp(`^set class-of-service interfaces ${iface.replace(/\//g,'\\/')}\\s+`, 'i'));
+      } else {
+        _deleteLines(router, /^set class-of-service interfaces\s+/i);
+      }
+      return true;
+    }
+    _deleteLines(router, /^set class-of-service\s+/i);
+    return true;
+  }
     const cfg = Storage.read(router.id, 'running') || '';
     return !cfg.split('\n').some(l => l.trim() === line.trim());
   }
@@ -1037,6 +1135,10 @@
       return true;
     }
 
+    if (cat === 'class-of-service') {
+      return _handleDeleteCoS(parts, router, io);
+    }
+
     io.println(`% Unknown delete path: ${parts.slice(1).join(' ')}`);
     return true;
   }
@@ -1115,8 +1217,60 @@
     }
 
     if (verb === 'show') {
-      const _SHOW_J = ['interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances','ldp','spring-te','ipv6','srv6'];
+      const _SHOW_J = ['class-of-service','interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances','ldp','spring-te','ipv6','srv6'];
       const sub = _ex(parts[1], _SHOW_J);
+
+      // show class-of-service interface [<ifname>] | show class-of-service classifier name [<name>]
+      if (sub === 'class-of-service') {
+        const cfg = Storage.read(router.id, 'running') || '';
+        const cosCfg = RouterQos.parseJunosCoS(cfg);
+        const sub2 = (parts[2] || '').toLowerCase();
+        if (sub2 === 'interface' || sub2 === '') {
+          const target = parts[3];
+          const grouped = new Map();
+          cosCfg.ifaceSchedulerMaps.forEach(e => {
+            if (target && !e.iface.toLowerCase().startsWith(target.toLowerCase())) return;
+            if (!grouped.has(e.iface)) grouped.set(e.iface, []);
+            grouped.get(e.iface).push(e.mapName);
+          });
+          if (grouped.size === 0) { io.println('  (no class-of-service interface config)'); return true; }
+          for (const [iface, maps] of grouped) {
+            io.println(`Physical interface: ${iface}`);
+            maps.forEach(mapName => {
+              const mapEntries = cosCfg.schedulerMaps.filter(m => m.mapName === mapName);
+              if (mapEntries.length === 0) {
+                io.println(`  Scheduler map: ${mapName}`);
+              } else {
+                mapEntries.forEach(me => {
+                  const sched = cosCfg.schedulers.find(s => s.name === me.schedulerName);
+                  io.println(`  Scheduler map: ${mapName}, Scheduler: ${me.schedulerName}`);
+                  if (sched) io.println(`    Transmit rate: ${sched.transmitRate}`);
+                });
+              }
+            });
+          }
+          return true;
+        }
+        if (sub2 === 'classifier') {
+          const target = parts[4]; // classifier name [<name>]
+          let shown = 0;
+          const byName = new Map();
+          cosCfg.classifiers.forEach(c => {
+            if (target && c.name.toLowerCase() !== target.toLowerCase()) return;
+            if (!byName.has(c.name)) byName.set(c.name, []);
+            byName.get(c.name).push(c);
+          });
+          for (const [name, entries] of byName) {
+            io.println(`Classifier: ${name}`);
+            entries.forEach(e => io.println(`  Forwarding class: ${e.fc}  Code point: ${e.codePoint}`));
+            shown++;
+          }
+          if (shown === 0) io.println('  (no classifiers configured)');
+          return true;
+        }
+        io.println(`% Unknown: show class-of-service ${sub2}`);
+        return true;
+      }
 
       // show srv6
       if (sub === 'srv6') {

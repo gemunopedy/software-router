@@ -102,16 +102,22 @@
       function saveState() {
         try {
           localStorage.setItem(STATE_KEY, JSON.stringify({
-            configMode:   state.configMode   || null,
-            configIface:  state.configIface  || null,
-            configRouter: state.configRouter || null,
+            configMode:      state.configMode      || null,
+            configIface:     state.configIface     || null,
+            configRouter:    state.configRouter    || null,
+            configCmap:      state.configCmap      || null,
+            configPmap:      state.configPmap      || null,
+            configPmapClass: state.configPmapClass || null,
           }));
         } catch (_) {}
       }
       const savedState = loadState();
-      state.configMode   = savedState.configMode   || null;
-      state.configIface  = savedState.configIface  || null;
-      state.configRouter = savedState.configRouter || null;
+      state.configMode      = savedState.configMode      || null;
+      state.configIface     = savedState.configIface     || null;
+      state.configRouter    = savedState.configRouter    || null;
+      state.configCmap      = savedState.configCmap      || null;
+      state.configPmap      = savedState.configPmap      || null;
+      state.configPmapClass = savedState.configPmapClass || null;
 
       const session = {
         router, term, fit, pane, tab: null, state, io,

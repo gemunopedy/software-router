@@ -801,6 +801,115 @@
     io.println(`% Invalid input after 'show ipv6 ${args[0] || ''}'`);
   };
 
+  // show class-map [<NAME>]
+  showHandlers['class-map'] = (args, router, io) => {
+    const cfg = readCfg(router);
+    const maps = RouterQos.parseClassMaps(cfg);
+    const target = args[0];
+    const dscpNames = { 0:'default(0)',8:'cs1(8)',10:'af11(10)',12:'af12(12)',14:'af13(14)',16:'cs2(16)',18:'af21(18)',20:'af22(20)',22:'af23(22)',24:'cs3(24)',26:'af31(26)',28:'af32(28)',30:'af33(30)',32:'cs4(32)',34:'af41(34)',36:'af42(36)',38:'af43(38)',40:'cs5(40)',46:'ef(46)',48:'cs6(48)',56:'cs7(56)' };
+    const fmtDscp = v => {
+      const n = parseInt(v, 10);
+      return isNaN(n) ? v : (dscpNames[n] || v);
+    };
+    let shown = 0;
+    maps.forEach((cm, idx) => {
+      if (target && cm.name.toLowerCase() !== target.toLowerCase()) return;
+      io.println(` Class Map ${cm.matchType} ${cm.name} (id ${idx + 1})`);
+      cm.matches.forEach(m => {
+        const val = m.type === 'dscp' || m.type === 'ip dscp' ? fmtDscp(m.value) : m.value;
+        io.println(`    Match: ${m.type} ${val}`);
+      });
+      shown++;
+    });
+    if (shown === 0) {
+      if (target) io.println(`% class-map ${target} not found`);
+      else io.println(' (no class-maps configured)');
+    }
+  };
+
+  // show policy-map [<NAME>] | show policy-map interface [<ifname>] [input|output]
+  showHandlers['policy-map'] = (args, router, io) => {
+    const cfg = readCfg(router);
+    // show policy-map interface ...
+    if ((args[0] || '').toLowerCase() === 'interface') {
+      const ifTarget = args[1];
+      const dirTarget = (args[2] || '').toLowerCase();
+      const sps = RouterQos.parseServicePolicies(cfg);
+      const pmaps = RouterQos.parsePolicyMaps(cfg);
+      const cmaps = RouterQos.parseClassMaps(cfg);
+      const matchedSps = sps.filter(sp => {
+        if (ifTarget && !sp.iface.toLowerCase().startsWith(ifTarget.toLowerCase())) return false;
+        if (dirTarget && sp.direction !== dirTarget) return false;
+        return true;
+      });
+      if (matchedSps.length === 0) { io.println(`% No policy-map found on interface`); return; }
+      matchedSps.forEach(sp => {
+        io.println(` ${sp.iface}`);
+        io.println('');
+        io.println(`  Service-policy ${sp.direction}: ${sp.policyName}`);
+        io.println('');
+        const pm = pmaps.find(p => p.name === sp.policyName);
+        if (!pm) { io.println(`    (policy-map ${sp.policyName} not found)`); return; }
+        pm.classes.forEach(cls => {
+          const cm = cmaps.find(c => c.name === cls.name);
+          const mt = cm ? cm.matchType : 'match-all';
+          io.println(`    Class-map: ${cls.name} (${mt})`);
+          io.println(`      0 packets, 0 bytes`);
+          io.println(`      5 minute offered rate 0000 bps, drop rate 0000 bps`);
+          cls.actions.forEach(a => {
+            const r = a.raw;
+            if (/^priority/i.test(r)) {
+              const kbps = r.match(/priority\s+(\d+)/i);
+              io.println(`      Priority: ${kbps ? kbps[1] : '?'} kbps, burst bytes 2500, b/w exceed drops: 0`);
+            } else if (/^bandwidth/i.test(r)) {
+              io.println(`      Bandwidth: ${r.replace(/^bandwidth\s+/i,'')}`);
+            } else if (/^police/i.test(r)) {
+              const bps = r.match(/police\s+(?:rate\s+)?(\S+)/i);
+              io.println(`      police rate: ${bps ? bps[1] : '?'} bps conform-action transmit exceed-action drop`);
+            } else if (/^shape/i.test(r)) {
+              io.println(`      Traffic Shaping: ${r.replace(/^shape\s+/i,'')}`);
+            } else if (/^fair-queue/i.test(r)) {
+              io.println(`      Fair-queue`);
+            } else if (/^set\s+dscp/i.test(r)) {
+              io.println(`      ${r}`);
+            } else {
+              io.println(`      ${r}`);
+            }
+          });
+          io.println('');
+        });
+      });
+      return;
+    }
+    // show policy-map [<NAME>]
+    const target = args[0];
+    const pmaps = RouterQos.parsePolicyMaps(cfg);
+    let shown = 0;
+    pmaps.forEach(pm => {
+      if (target && pm.name.toLowerCase() !== target.toLowerCase()) return;
+      io.println(`  Policy Map ${pm.name}`);
+      pm.classes.forEach(cls => {
+        io.println(`    Class ${cls.name}`);
+        cls.actions.forEach(a => {
+          const r = a.raw;
+          if (/^priority/i.test(r)) {
+            const kbps = r.match(/priority\s+(\d+)/i);
+            io.println(`      Priority: ${kbps ? kbps[1] : '?'} (kbps), burst bytes 2500, b/w exceed drops: 0`);
+          } else if (/^fair-queue/i.test(r)) {
+            io.println(`      Fair-queue`);
+          } else {
+            io.println(`      ${r}`);
+          }
+        });
+      });
+      shown++;
+    });
+    if (shown === 0) {
+      if (target) io.println(`% policy-map ${target} not found`);
+      else io.println('  (no policy-maps configured)');
+    }
+  };
+
   // ------- フィルタ (| include / exclude / section) -------
   function filterOutput(cfg, op, pat, io) {
     let re;
@@ -905,6 +1014,193 @@
         Storage.write(router.id, 'running', out.join('\n'));
       }
     }
+  }
+
+  // ---- QoS ヘルパー ----
+
+  // class-map ブロック内の match 行を更新（既存の同一 matchRe 行を置換、なければ追加）
+  function _updateCmapLine(router, cmapName, matchRe, newLine) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const lines = cfg.split('\n');
+    const headerRe = new RegExp(`^class-map\\s+\\S+\\s+${cmapName.replace(/[-/]/g,'[-/]')}\\s*$`, 'i');
+    let inBlock = false, replaced = false;
+    const out = [];
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { inBlock = true; out.push(t); continue; }
+      if (inBlock) {
+        if (/^[^ \t!]/.test(t) && t !== '') { inBlock = false; }
+        else if (t.startsWith(' ') || t.startsWith('\t')) {
+          if (matchRe.test(t.trim())) { out.push(' ' + newLine); replaced = true; continue; }
+        }
+      }
+      out.push(t);
+    }
+    if (!replaced) {
+      const insertIdx = out.findIndex(l => headerRe.test(l.trimEnd()));
+      if (insertIdx >= 0) {
+        let end = insertIdx + 1;
+        while (end < out.length && (out[end].startsWith(' ') || out[end].startsWith('\t'))) end++;
+        out.splice(end, 0, ' ' + newLine);
+      }
+    }
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  // class-map ブロック内の match 行を削除
+  function _removeCmapLine(router, cmapName, matchRe) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^class-map\\s+\\S+\\s+${cmapName.replace(/[-/]/g,'[-/]')}\\s*$`, 'i');
+    let inBlock = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { inBlock = true; return true; }
+      if (inBlock && (t.startsWith(' ') || t.startsWith('\t'))) return !matchRe.test(t.trim());
+      if (inBlock && /^[^ \t!]/.test(t) && t !== '') inBlock = false;
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  // class-map ブロック全体を削除
+  function _removeCmapBlock(router, name) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^class-map\\s+\\S+\\s+${name.replace(/[-/]/g,'[-/]')}\\s*$`, 'i');
+    let skip = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { skip = true; return false; }
+      if (skip) {
+        if (t.startsWith(' ') || t.startsWith('\t') || t === '' || t === '!') return false;
+        skip = false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  // policy-map > class ブロック内のアクション行を更新（置換 or 追加）
+  function _updatePmapClassAction(router, pmapName, className, matchRe, newLine) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const lines = cfg.split('\n');
+    const pmHeaderRe = new RegExp(`^policy-map\\s+${pmapName.replace(/[-/]/g,'[-/]')}\\s*$`, 'i');
+    const clHeaderRe = new RegExp(`^\\s+class\\s+${className.replace(/[-/]/g,'[-/]')}\\s*$`, 'i');
+    let inPmap = false, inClass = false, replaced = false;
+    const out = [];
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (pmHeaderRe.test(t)) { inPmap = true; inClass = false; out.push(t); continue; }
+      if (inPmap) {
+        if (/^[^ \t!]/.test(t) && t !== '') { inPmap = false; inClass = false; }
+        else if (clHeaderRe.test(t)) { inClass = true; out.push(t); continue; }
+        else if (inClass) {
+          if (/^ {2}/.test(raw) || /^\t\t/.test(raw)) {
+            if (matchRe && matchRe.test(t.trim())) { out.push('  ' + newLine); replaced = true; continue; }
+          } else if (/^ [^ ]/.test(raw)) {
+            inClass = false;
+          }
+        }
+      }
+      out.push(t);
+    }
+    if (!replaced) {
+      // class ブロック末尾に追加
+      const pmIdx = out.findIndex(l => pmHeaderRe.test(l.trimEnd()));
+      if (pmIdx >= 0) {
+        let clIdx = -1;
+        for (let i = pmIdx + 1; i < out.length; i++) {
+          if (clHeaderRe.test(out[i].trimEnd())) { clIdx = i; break; }
+          if (/^[^ \t!]/.test(out[i].trimEnd()) && out[i].trim() !== '') break;
+        }
+        if (clIdx >= 0) {
+          let end = clIdx + 1;
+          while (end < out.length && /^ {2}/.test(out[end])) end++;
+          out.splice(end, 0, '  ' + newLine);
+        }
+      }
+    }
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  // policy-map > class ブロック内のアクション行を削除
+  function _removePmapClassAction(router, pmapName, className, matchRe) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const pmHeaderRe = new RegExp(`^policy-map\\s+${pmapName.replace(/[-/]/g,'[-/]')}\\s*$`, 'i');
+    const clHeaderRe = new RegExp(`^\\s+class\\s+${className.replace(/[-/]/g,'[-/]')}\\s*$`, 'i');
+    let inPmap = false, inClass = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (pmHeaderRe.test(t)) { inPmap = true; inClass = false; return true; }
+      if (inPmap) {
+        if (/^[^ \t!]/.test(t) && t !== '') { inPmap = false; inClass = false; return true; }
+        if (clHeaderRe.test(t)) { inClass = true; return true; }
+        if (inClass && /^ {2}/.test(raw)) return !matchRe.test(t.trim());
+        if (inClass && /^ [^ ]/.test(raw)) inClass = false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  // policy-map ブロック全体を削除
+  function _removePmapBlock(router, name) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const headerRe = new RegExp(`^policy-map\\s+${name.replace(/[-/]/g,'[-/]')}\\s*$`, 'i');
+    let skip = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (headerRe.test(t)) { skip = true; return false; }
+      if (skip) {
+        if (t.startsWith(' ') || t.startsWith('\t') || t === '' || t === '!') return false;
+        skip = false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  // policy-map に class ブロックを追加（なければ）
+  function _ensurePmapClass(router, pmapName, className) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const pmHeaderRe = new RegExp(`^policy-map\\s+${pmapName.replace(/[-/]/g,'[-/]')}\\s*$`, 'i');
+    const clHeaderRe = new RegExp(`^\\s+class\\s+${className.replace(/[-/]/g,'[-/]')}\\s*$`, 'i');
+    const lines = cfg.split('\n');
+    let inPmap = false, hasClass = false, pmIdx = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (pmHeaderRe.test(lines[i].trimEnd())) { inPmap = true; pmIdx = i; continue; }
+      if (inPmap) {
+        if (/^[^ \t!]/.test(lines[i].trimEnd()) && lines[i].trim() !== '') { inPmap = false; break; }
+        if (clHeaderRe.test(lines[i].trimEnd())) { hasClass = true; break; }
+      }
+    }
+    if (!hasClass && pmIdx >= 0) {
+      // policy-map ブロック末尾（次のトップレベル行の直前）に class を追加
+      const out = [...lines];
+      let end = pmIdx + 1;
+      while (end < out.length && (out[end].startsWith(' ') || out[end].startsWith('\t') || out[end].trim() === '' || out[end].trim() === '!')) end++;
+      out.splice(end, 0, ` class ${className}`);
+      Storage.write(router.id, 'running', out.join('\n'));
+    }
+  }
+
+  // policy-map から class ブロックを削除
+  function _removePmapClass(router, pmapName, className) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const pmHeaderRe = new RegExp(`^policy-map\\s+${pmapName.replace(/[-/]/g,'[-/]')}\\s*$`, 'i');
+    const clHeaderRe = new RegExp(`^\\s+class\\s+${className.replace(/[-/]/g,'[-/]')}\\s*$`, 'i');
+    let inPmap = false, skipClass = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (pmHeaderRe.test(t)) { inPmap = true; skipClass = false; return true; }
+      if (inPmap) {
+        if (/^[^ \t!]/.test(t) && t !== '') { inPmap = false; skipClass = false; return true; }
+        if (clHeaderRe.test(t)) { skipClass = true; return false; }
+        if (skipClass && /^ {2}/.test(raw)) return false;
+        if (skipClass && /^ [^ ]/.test(raw)) skipClass = false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
   }
 
   // インタフェースブロックを丸ごと削除する
@@ -1373,16 +1669,22 @@
   // parts[0] = 動詞（'show' / 'write' / ...）
   // モード別動詞候補（prefix 展開用）
   const _ECANDS = ['configure','clear','copy','disable','enable','exit','help','load-config','no','ping','send','show','write'];
-  const _CCANDS = ['do','end','exit','hostname','interface','ip','ipv6','isis','mpls','no','router','vrf'];
-  const _ICANDS = ['description','do','end','exit','ip','ipv6','isis','mpls','no','shutdown','vrf'];
+  const _CCANDS = ['class-map','do','end','exit','hostname','interface','ip','ipv6','isis','mpls','no','policy-map','router','vrf'];
+  const _ICANDS = ['description','do','end','exit','ip','ipv6','isis','mpls','no','service-policy','shutdown','vrf'];
   const _BCANDS = ['bgp','do','end','exit','neighbor','network','no','router-id'];
   const _VDEFCANDS = ['address-family', 'exit-address-family', 'rd', 'route-target', 'no', 'exit', 'end'];
+  const _CMAPCANDS = ['match', 'no', 'exit', 'end'];
+  const _PMAPCANDS = ['class', 'no', 'exit', 'end'];
+  const _PMAPCCANDS = ['bandwidth', 'fair-queue', 'no', 'police', 'priority', 'set', 'shape', 'exit', 'end'];
 
   function handleCommand(parts, state, io) {
     const router = state.router;
     const _vcands = state.configMode === 'if' ? _ICANDS
                   : state.configMode === 'router' ? _BCANDS
                   : state.configMode === 'vrf-def' ? _VDEFCANDS
+                  : state.configMode === 'cmap' ? _CMAPCANDS
+                  : state.configMode === 'pmap' ? _PMAPCANDS
+                  : state.configMode === 'pmap-class' ? _PMAPCCANDS
                   : state.configMode ? _CCANDS
                   : _ECANDS;
     const verb = _ex(parts[0], _vcands);
@@ -1402,7 +1704,13 @@
         return true;
       }
       if (verb === 'exit') {
-        if (state.configMode === 'srv6-loc') {
+        if (state.configMode === 'pmap-class') {
+          state.configMode = 'pmap'; state.configPmapClass = null;
+        } else if (state.configMode === 'pmap') {
+          state.configMode = 'global'; state.configPmap = null;
+        } else if (state.configMode === 'cmap') {
+          state.configMode = 'global'; state.configCmap = null;
+        } else if (state.configMode === 'srv6-loc') {
           state.configMode = 'srv6-locs';
           state.configSrv6LocatorName = null;
         } else if (state.configMode === 'srv6-locs') {
@@ -1603,6 +1911,26 @@
             _removeIfaceLine(router, ifaceName, new RegExp(`^ipv6 address\\s+${escaped}$`, 'i'));
           } else {
             _removeIfaceLine(router, ifaceName, /^ipv6 address\s+/i);
+          }
+          return true;
+        }
+
+        // service-policy {input|output} <policy-name>
+        if (verb === 'service-policy') {
+          const dir = (parts[1] || '').toLowerCase();
+          const pname = parts[2];
+          if (dir !== 'input' && dir !== 'output') { io.println('% Usage: service-policy {input|output} <policy-name>'); return true; }
+          if (!pname) { io.println('% Incomplete command: policy-name required'); return true; }
+          _updateIfaceLine(router, ifaceName, new RegExp(`^service-policy\\s+${dir}\\s+`, 'i'), `service-policy ${dir} ${pname}`);
+          return true;
+        }
+        // no service-policy {input|output}
+        if (verb === 'no' && (parts[1] || '').toLowerCase() === 'service-policy') {
+          const dir = (parts[2] || '').toLowerCase();
+          if (dir === 'input' || dir === 'output') {
+            _removeIfaceLine(router, ifaceName, new RegExp(`^service-policy\\s+${dir}\\s+`, 'i'));
+          } else {
+            _removeIfaceLine(router, ifaceName, /^service-policy\s+/i);
           }
           return true;
         }
@@ -2129,6 +2457,162 @@
         return true;
       }
 
+      // ---------- config-cmap モード ----------
+      if (state.configMode === 'cmap') {
+        const cmapName = state.configCmap;
+        if (verb === 'match') {
+          const type = (parts[1] || '').toLowerCase();
+          const val = parts.slice(2).join(' ');
+          if (!val) { io.println('% Incomplete command.'); return true; }
+          if (type === 'dscp' || type === 'ip') {
+            const fullType = type === 'ip' && (parts[2] || '').toLowerCase() === 'dscp' ? 'ip dscp' : type;
+            const matchVal = type === 'ip' ? parts.slice(3).join(' ') : val;
+            _updateCmapLine(router, cmapName, new RegExp(`^match\\s+${fullType.replace(' ','\\s+')}\\s+`, 'i'), `match ${fullType} ${matchVal}`);
+          } else if (type === 'precedence' || type === 'protocol' || type === 'access-group') {
+            _updateCmapLine(router, cmapName, new RegExp(`^match\\s+${type}\\s+`, 'i'), `match ${type} ${val}`);
+          } else {
+            io.println(`% Unrecognized match type: ${type}`);
+          }
+          return true;
+        }
+        if (verb === 'no' && (parts[1] || '').toLowerCase() === 'match') {
+          const type = (parts[2] || '').toLowerCase();
+          if (type === 'ip' && (parts[3] || '').toLowerCase() === 'dscp') {
+            _removeCmapLine(router, cmapName, /^match\s+ip\s+dscp\s+/i);
+          } else if (type === 'dscp') {
+            _removeCmapLine(router, cmapName, /^match\s+dscp\s+/i);
+          } else if (type === 'precedence') {
+            _removeCmapLine(router, cmapName, /^match\s+precedence\s+/i);
+          } else if (type === 'protocol') {
+            _removeCmapLine(router, cmapName, /^match\s+protocol\s+/i);
+          } else if (type === 'access-group') {
+            _removeCmapLine(router, cmapName, /^match\s+access-group\s+/i);
+          } else {
+            io.println(`% Unrecognized match type: ${type}`);
+          }
+          return true;
+        }
+        io.println(`% Invalid input in config-cmap mode: ${parts.join(' ')}`);
+        return true;
+      }
+
+      // ---------- config-pmap モード ----------
+      if (state.configMode === 'pmap') {
+        const pmapName = state.configPmap;
+        if (verb === 'class') {
+          const className = parts[1];
+          if (!className) { io.println('% Incomplete command: class name required'); return true; }
+          _ensurePmapClass(router, pmapName, className);
+          state.configMode = 'pmap-class';
+          state.configPmapClass = className;
+          return true;
+        }
+        if (verb === 'no' && (parts[1] || '').toLowerCase() === 'class') {
+          const className = parts[2];
+          if (!className) { io.println('% Incomplete command: class name required'); return true; }
+          _removePmapClass(router, pmapName, className);
+          return true;
+        }
+        io.println(`% Invalid input in config-pmap mode: ${parts.join(' ')}`);
+        return true;
+      }
+
+      // ---------- config-pmap-class モード ----------
+      if (state.configMode === 'pmap-class') {
+        const pmapName = state.configPmap;
+        const className = state.configPmapClass;
+        if (verb === 'priority') {
+          const kbps = parts[1] || '';
+          const line = kbps ? `priority ${kbps}` : 'priority';
+          _updatePmapClassAction(router, pmapName, className, /^priority/i, line);
+          return true;
+        }
+        if (verb === 'bandwidth') {
+          const v = parts.slice(1).join(' ');
+          if (!v) { io.println('% Incomplete command.'); return true; }
+          _updatePmapClassAction(router, pmapName, className, /^bandwidth\s+/i, `bandwidth ${v}`);
+          return true;
+        }
+        if (verb === 'police') {
+          const v = parts.slice(1).join(' ');
+          if (!v) { io.println('% Incomplete command.'); return true; }
+          _updatePmapClassAction(router, pmapName, className, /^police\s+/i, `police ${v}`);
+          return true;
+        }
+        if (verb === 'shape') {
+          const v = parts.slice(1).join(' ');
+          if (!v) { io.println('% Incomplete command.'); return true; }
+          _updatePmapClassAction(router, pmapName, className, /^shape\s+/i, `shape ${v}`);
+          return true;
+        }
+        if (verb === 'set') {
+          const v = parts.slice(1).join(' ');
+          if (!v) { io.println('% Incomplete command.'); return true; }
+          _updatePmapClassAction(router, pmapName, className, /^set\s+/i, `set ${v}`);
+          return true;
+        }
+        if (verb === 'fair-queue') {
+          _updatePmapClassAction(router, pmapName, className, /^fair-queue$/i, 'fair-queue');
+          return true;
+        }
+        if (verb === 'no') {
+          const sub = (parts[1] || '').toLowerCase();
+          if (sub === 'priority')    { _removePmapClassAction(router, pmapName, className, /^priority/i); return true; }
+          if (sub === 'bandwidth')   { _removePmapClassAction(router, pmapName, className, /^bandwidth\s+/i); return true; }
+          if (sub === 'police')      { _removePmapClassAction(router, pmapName, className, /^police\s+/i); return true; }
+          if (sub === 'shape')       { _removePmapClassAction(router, pmapName, className, /^shape\s+/i); return true; }
+          if (sub === 'set')         { _removePmapClassAction(router, pmapName, className, /^set\s+/i); return true; }
+          if (sub === 'fair-queue')  { _removePmapClassAction(router, pmapName, className, /^fair-queue$/i); return true; }
+          io.println(`% Unrecognized 'no' argument: ${sub}`);
+          return true;
+        }
+        io.println(`% Invalid input in config-pmap-c mode: ${parts.join(' ')}`);
+        return true;
+      }
+
+      // ---------- global config: class-map / policy-map ----------
+      if (verb === 'class-map') {
+        let matchType = 'match-all', name;
+        if (/^match-(all|any)$/i.test(parts[1] || '')) {
+          matchType = parts[1].toLowerCase(); name = parts[2];
+        } else {
+          name = parts[1];
+        }
+        if (!name) { io.println('% Incomplete command: class-map name required'); return true; }
+        const cfg2 = Storage.read(router.id, 'running') || '';
+        const exists = new RegExp(`^class-map\\s+\\S+\\s+${name.replace(/[-/]/g,'[-/]')}\\s*$`, 'im').test(cfg2);
+        if (!exists) {
+          Storage.write(router.id, 'running', cfg2.trimEnd() + `\nclass-map ${matchType} ${name}\n!\n`);
+        }
+        state.configMode = 'cmap';
+        state.configCmap = name;
+        return true;
+      }
+      if (verb === 'no' && _ex(parts[1], ['class-map','policy-map','router','interface','hostname','ip','ipv6','vrf','mpls','segment-routing']) === 'class-map') {
+        const name = parts[2];
+        if (!name) { io.println('% Incomplete command.'); return true; }
+        _removeCmapBlock(router, name);
+        return true;
+      }
+      if (verb === 'policy-map') {
+        const name = parts[1];
+        if (!name) { io.println('% Incomplete command: policy-map name required'); return true; }
+        const cfg2 = Storage.read(router.id, 'running') || '';
+        const exists = new RegExp(`^policy-map\\s+${name.replace(/[-/]/g,'[-/]')}\\s*$`, 'im').test(cfg2);
+        if (!exists) {
+          Storage.write(router.id, 'running', cfg2.trimEnd() + `\npolicy-map ${name}\n!\n`);
+        }
+        state.configMode = 'pmap';
+        state.configPmap = name;
+        return true;
+      }
+      if (verb === 'no' && _ex(parts[1], ['class-map','policy-map','router','interface','hostname','ip','ipv6','vrf','mpls','segment-routing']) === 'policy-map') {
+        const name = parts[2];
+        if (!name) { io.println('% Incomplete command.'); return true; }
+        _removePmapBlock(router, name);
+        return true;
+      }
+
       // no ipv6 route <prefix/len>
       if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip','ipv6']) === 'ipv6' && _ex(parts[2], ['route']) === 'route') {
         const cidr = parts[3];
@@ -2167,7 +2651,7 @@
 
     // --- show ---
     if (verb === 'show' || verb === 'sh') {
-      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','ip','ipv6','arp','interfaces','ospf','clock','history','isis','clns','vrf','mpls','segment-routing'];
+      const _SHOW_KEYS = ['class-map','policy-map','running-config','run','startup-config','start','version','ver','ip','ipv6','arp','interfaces','ospf','clock','history','isis','clns','vrf','mpls','segment-routing'];
       const sub = _ex(parts[1], _SHOW_KEYS);
       if (!sub) {
         io.println('% Incomplete command. Type "show ?" for help.');

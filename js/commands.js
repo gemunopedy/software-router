@@ -103,19 +103,25 @@
   function buildPrompt(router, state) {
     const host = getHostname(router);
     if (router.os === 'ios-xe') {
-      if (state && state.configMode === 'if')      return host + '(config-if)# ';
-      if (state && state.configMode === 'router')  return host + '(config-router)# ';
-      if (state && state.configMode === 'vrf-def') return host + '(config-vrf)# ';
-      if (state && state.configMode === 'global')  return host + '(config)# ';
+      if (state && state.configMode === 'if')         return host + '(config-if)# ';
+      if (state && state.configMode === 'router')     return host + '(config-router)# ';
+      if (state && state.configMode === 'vrf-def')    return host + '(config-vrf)# ';
+      if (state && state.configMode === 'cmap')       return host + '(config-cmap)# ';
+      if (state && state.configMode === 'pmap')       return host + '(config-pmap)# ';
+      if (state && state.configMode === 'pmap-class') return host + '(config-pmap-c)# ';
+      if (state && state.configMode === 'global')     return host + '(config)# ';
       return host + '# ';
     }
     if (router.os === 'ios-xr') {
-      if (state && state.configMode === 'if')     return 'RP/0/RP0/CPU0:' + host + '(config-if)# ';
-      if (state && state.configMode === 'router') return 'RP/0/RP0/CPU0:' + host + '(config-bgp)# ';
+      if (state && state.configMode === 'if')         return 'RP/0/RP0/CPU0:' + host + '(config-if)# ';
+      if (state && state.configMode === 'router')     return 'RP/0/RP0/CPU0:' + host + '(config-bgp)# ';
       if (state && state.configMode === 'static' && state.configStaticAf === 'ipv6') return 'RP/0/RP0/CPU0:' + host + '(config-static-af-ipv6)# ';
-      if (state && state.configMode === 'static') return 'RP/0/RP0/CPU0:' + host + '(config-static)# ';
-      if (state && state.configMode === 'vrf')    return 'RP/0/RP0/CPU0:' + host + '(config-vrf)# ';
-      if (state && state.configMode === 'global') return 'RP/0/RP0/CPU0:' + host + '(config)# ';
+      if (state && state.configMode === 'static')     return 'RP/0/RP0/CPU0:' + host + '(config-static)# ';
+      if (state && state.configMode === 'vrf')        return 'RP/0/RP0/CPU0:' + host + '(config-vrf)# ';
+      if (state && state.configMode === 'cmap')       return 'RP/0/RP0/CPU0:' + host + '(config-cmap)# ';
+      if (state && state.configMode === 'pmap')       return 'RP/0/RP0/CPU0:' + host + '(config-pmap)# ';
+      if (state && state.configMode === 'pmap-class') return 'RP/0/RP0/CPU0:' + host + '(config-pmap-c)# ';
+      if (state && state.configMode === 'global')     return 'RP/0/RP0/CPU0:' + host + '(config)# ';
       return 'RP/0/RP0/CPU0:' + host + '# ';
     }
     if (router.os === 'junos') {
