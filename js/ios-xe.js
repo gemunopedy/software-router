@@ -555,6 +555,76 @@
     else io.println(`% Unrecognized 'show clns ${args[0]}'`);
   };
 
+  showHandlers['mpls'] = (args, router, io) => {
+    if (!window.RouterMpls) { io.println('% MPLS not initialized'); return; }
+    const sub = _ex(args[0], ['ldp', 'forwarding-table']);
+    if (sub === 'ldp') {
+      const sub2 = _ex(args[1], ['neighbor', 'bindings']);
+      if (sub2 === 'neighbor' || !args[1]) {
+        const neighbors = window.RouterMpls.getNeighbors(router.id);
+        if (neighbors.length === 0) { io.println('    (no LDP neighbors)'); return; }
+        const cfg = readCfg(router);
+        const ifList = parseInterfaces(cfg);
+        const myLdpM = cfg.match(/^mpls ldp router-id\s+(\S+)/im);
+        let myLdp = myLdpM ? myLdpM[1] : null;
+        if (myLdp && !/^\d+/.test(myLdp)) {
+          const blk = ifList.find(b => b.name.toLowerCase() === myLdp.toLowerCase());
+          if (blk) { const ipInfo = getIfIp(blk); myLdp = ipInfo ? ipInfo.ip : myLdp; }
+        }
+        if (!myLdp) {
+          const lo = ifList.find(b => /^loopback0$/i.test(b.name));
+          if (lo) { const ipInfo = getIfIp(lo); myLdp = ipInfo ? ipInfo.ip : null; }
+        }
+        if (!myLdp) {
+          const first = ifList.find(b => getIfIp(b));
+          if (first) { const ipInfo = getIfIp(first); myLdp = ipInfo ? ipInfo.ip : router.id; }
+          else myLdp = router.id;
+        }
+        neighbors.forEach(n => {
+          const peerLdp = n.ldpId;
+          io.println(`    Peer LDP Ident: ${peerLdp}; Local LDP Ident ${myLdp}:0`);
+          io.println(`        TCP connection: ${peerLdp.replace(':0','')}.646 - ${myLdp}.58000`);
+          io.println(`        State: Oper; Msgs sent/rcvd: 12/12; Downstream`);
+          io.println(`        Up time: ${n.uptime}`);
+          io.println(`        LDP discovery sources:`);
+          io.println(`          ${n.iface}, Src IP addr: ${n.neighborIp}`);
+          io.println(`        Addresses bound to peer LDP Ident:`);
+          io.println(`          ${n.neighborIp}`);
+        });
+        return;
+      }
+      if (sub2 === 'bindings') {
+        const bindings = window.RouterMpls.getBindings(router.id);
+        if (bindings.length === 0) { io.println('    (no LDP bindings)'); return; }
+        bindings.forEach((b, i) => {
+          io.println(`  lib entry: ${b.fec}, rev ${(i + 1) * 2}`);
+          io.println(`        local binding:  label: ${b.localLabel}`);
+          b.remoteBindings.forEach(r => {
+            io.println(`        remote binding: lsr: ${r.lsr}, label: ${r.label}`);
+          });
+        });
+        return;
+      }
+      io.println(`% Invalid input after 'show mpls ldp ${args[1]}'`);
+      return;
+    }
+    if (sub === 'forwarding-table') {
+      const table = window.RouterMpls.getForwardingTable(router.id);
+      io.println('Local  Outgoing    Prefix            Bytes     Outgoing   Next Hop');
+      io.println('Label  Label or VC or Tunnel Id      Switched  interface');
+      if (table.length === 0) { io.println('  (empty)'); return; }
+      table.forEach(e => {
+        const loc = String(e.inLabel).padEnd(7);
+        const out = e.outLabel.padEnd(12);
+        const pref = e.prefix.padEnd(18);
+        const iface = (e.iface || '-').replace(/^GigabitEthernet/i, 'Gi').padEnd(11);
+        io.println(`${loc}${out}${pref}0         ${iface}${e.nexthop}`);
+      });
+      return;
+    }
+    io.println(`% Invalid input after 'show mpls'`);
+  };
+
   showHandlers['vrf'] = (args, router, io) => {
     const cfg = readCfg(router);
     const vrfs = getVrfDefinitions(cfg);
@@ -696,6 +766,24 @@
     }
     return null;
   }
+  function getMplsConfig(cfg) {
+    const ifaces = parseInterfaces(cfg);
+    const ldpRidM = (cfg || '').match(/^mpls ldp router-id\s+(\S+)/im);
+    let ldpRouterId = ldpRidM ? ldpRidM[1] : null;
+    if (ldpRouterId && !/^\d+\.\d+\.\d+\.\d+$/.test(ldpRouterId)) {
+      const blk = ifaces.find(i => i.name.toLowerCase() === ldpRouterId.toLowerCase());
+      if (blk) {
+        const ip = getIfIp(blk);
+        ldpRouterId = ip ? ip.ip : null;
+      }
+    }
+    const mplsIfaces = ifaces
+      .filter(blk => blk.lines.some(l => /^mpls ip$/i.test(l)))
+      .map(blk => ({ name: blk.name, mplsEnabled: true, ldpEnabled: true }));
+    if (!mplsIfaces.length) return null;
+    return { interfaces: mplsIfaces, ldpRouterId };
+  }
+
   // 'router bgp 65001' ブロック内の行を更新/追加する
   function _updateRouterLine(router, procKey, matchRe, newLine) {
     const cfg = Storage.read(router.id, 'running') || '';
@@ -984,8 +1072,8 @@
   // parts[0] = 動詞（'show' / 'write' / ...）
   // モード別動詞候補（prefix 展開用）
   const _ECANDS = ['configure','clear','copy','disable','enable','exit','help','load-config','no','ping','send','show','write'];
-  const _CCANDS = ['do','end','exit','hostname','interface','ip','isis','no','router','vrf'];
-  const _ICANDS = ['description','do','end','exit','ip','isis','no','shutdown','vrf'];
+  const _CCANDS = ['do','end','exit','hostname','interface','ip','isis','mpls','no','router','vrf'];
+  const _ICANDS = ['description','do','end','exit','ip','isis','mpls','no','shutdown','vrf'];
   const _BCANDS = ['bgp','do','end','exit','neighbor','network','no','router-id'];
   const _VDEFCANDS = ['address-family', 'exit-address-family', 'rd', 'route-target', 'no', 'exit', 'end'];
 
@@ -1138,6 +1226,19 @@
         // no vrf forwarding
         if (verb === 'no' && _ex(parts[1], ['vrf','ip','description','shutdown']) === 'vrf') {
           _removeIfaceLine(router, ifaceName, /^vrf forwarding\s+/i);
+          return true;
+        }
+
+        // mpls ip
+        if (verb === 'mpls' && (parts[1] || '').toLowerCase() === 'ip') {
+          _updateIfaceLine(router, ifaceName, /^mpls ip$/i, 'mpls ip');
+          if (window.RouterMpls) window.RouterMpls.recalculate(router.id);
+          return true;
+        }
+        // no mpls ip
+        if (verb === 'no' && _ex(parts[1], ['mpls','ip','description','shutdown','isis','vrf']) === 'mpls' && (parts[2] || '').toLowerCase() === 'ip') {
+          _removeIfaceLine(router, ifaceName, /^mpls ip$/i);
+          if (window.RouterMpls) window.RouterMpls.recalculate(router.id);
           return true;
         }
 
@@ -1521,6 +1622,27 @@
         }
       }
 
+      // mpls ldp router-id <iface> [force]
+      if (verb === 'mpls' && _ex(parts[1], ['ldp']) === 'ldp' && _ex(parts[2], ['router-id']) === 'router-id') {
+        const iface = parts[3];
+        if (!iface) { io.println('% Incomplete command.'); return true; }
+        const cfg2 = Storage.read(router.id, 'running') || '';
+        const newLine = `mpls ldp router-id ${iface}`;
+        const updated = /^mpls ldp router-id\s+/im.test(cfg2)
+          ? cfg2.replace(/^mpls ldp router-id\s+\S+.*/im, newLine)
+          : cfg2.trimEnd() + '\n' + newLine + '\n';
+        Storage.write(router.id, 'running', updated);
+        if (window.RouterMpls) window.RouterMpls.recalculate(router.id);
+        return true;
+      }
+      // no mpls ldp router-id
+      if (verb === 'no' && _ex(parts[1], ['mpls']) === 'mpls' && _ex(parts[2], ['ldp']) === 'ldp') {
+        const cfg2 = Storage.read(router.id, 'running') || '';
+        Storage.write(router.id, 'running', cfg2.replace(/^mpls ldp router-id\s+\S+.*\n?/im, ''));
+        if (window.RouterMpls) window.RouterMpls.recalculate(router.id);
+        return true;
+      }
+
       io.println(`% Invalid input in config mode: ${parts.join(' ')}`);
       return true;
     }
@@ -1548,7 +1670,7 @@
 
     // --- show ---
     if (verb === 'show' || verb === 'sh') {
-      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','ip','arp','interfaces','ospf','clock','history','isis','clns','vrf'];
+      const _SHOW_KEYS = ['running-config','run','startup-config','start','version','ver','ip','arp','interfaces','ospf','clock','history','isis','clns','vrf','mpls'];
       const sub = _ex(parts[1], _SHOW_KEYS);
       if (!sub) {
         io.println('% Incomplete command. Type "show ?" for help.');
@@ -1629,7 +1751,7 @@
     if (mode === 'if') {
       // config-if モード
       if (before.length === 0) {
-        return ['ip', 'description', 'shutdown', 'no', 'exit', 'end']
+        return ['ip', 'description', 'mpls', 'shutdown', 'no', 'exit', 'end']
           .filter(c => c.startsWith(last.toLowerCase()));
       }
       const v = before[0];
@@ -1719,7 +1841,7 @@
     // show ...
     if (verb === 'show' || verb === 'sh') {
       if (before.length === 1) {
-        const subs = ['arp', 'clock', 'history', 'interfaces', 'ip', 'ospf',
+        const subs = ['arp', 'clock', 'history', 'interfaces', 'ip', 'mpls', 'ospf',
                       'running-config', 'startup-config', 'version'];
         return subs.filter(s => s.startsWith(last.toLowerCase()));
       }
@@ -1745,6 +1867,10 @@
         if (before[2] === 'bgp' && before.length === 3) {
           return ['summary'].filter(s => s.startsWith(last.toLowerCase()));
         }
+      }
+      if (sub === 'mpls') {
+        if (before.length === 2) return ['ldp', 'forwarding-table'].filter(s => s.startsWith(last.toLowerCase()));
+        if (before[2] === 'ldp' && before.length === 3) return ['neighbor', 'bindings'].filter(s => s.startsWith(last.toLowerCase()));
       }
       if (sub === 'interfaces' || sub === 'interface') {
         if (before.length === 2) {
@@ -1960,8 +2086,22 @@
     },
   });
 
-  // すべての OS パーサが登録されたあとに IS-IS / OSPF ルートを復元する
-  setTimeout(() => { RouterIsis.restoreAll(); RouterOspf.restoreAll(); }, 0);
+  // MPLS パーサ登録
+  if (window.RouterMpls) {
+    window.RouterMpls.registerOsParser('ios-xe', {
+      getMplsConfig,
+      getInterfaceList(cfg) {
+        return parseInterfaces(cfg).map(blk => ({
+          name: blk.name,
+          ip: getIfaceIp(blk),
+          mask: getIfaceMask(blk),
+        })).filter(f => f.ip);
+      },
+    });
+  }
+
+  // すべての OS パーサが登録されたあとに IS-IS / OSPF / MPLS ルートを復元する
+  setTimeout(() => { RouterIsis.restoreAll(); RouterOspf.restoreAll(); if (window.RouterMpls) window.RouterMpls.restoreAll(); }, 0);
 
   global.RouterIosXe = { handleCommand, complete, restoreBgpSessions };
 })(window);
