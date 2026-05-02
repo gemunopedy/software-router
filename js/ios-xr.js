@@ -2682,89 +2682,233 @@
     const last = tokens[tokens.length - 1];
     const before = tokens.slice(0, -1).map(t => t.toLowerCase());
 
+    const cfg = () => Storage.read(router.id, 'running') || Storage.read(router.id, 'startup') || '';
+
+    function _fil(arr) { return arr.filter(c => c.toLowerCase().startsWith(last.toLowerCase())); }
+
     function ifaceNames() {
-      const cfg = Storage.read(router.id, 'running') || Storage.read(router.id, 'startup') || '';
-      return (cfg.match(/^interface\s+(\S+)/gim) || []).map(l => l.replace(/^interface\s+/i,'').trim());
+      return (cfg().match(/^interface\s+(\S+)/gim) || []).map(l => l.replace(/^interface\s+/i,'').trim());
+    }
+    function ifaceNamesFull() {
+      const existing = ifaceNames();
+      const defs = ['GigabitEthernet0/0/0/0','GigabitEthernet0/0/0/1','GigabitEthernet0/0/0/2','Loopback0'];
+      return [...new Set([...existing, ...defs.filter(d => !existing.some(e => e.toLowerCase() === d.toLowerCase()))])];
+    }
+    function cmapNames() {
+      return (cfg().match(/^class-map\s+\S+\s+(\S+)/gim) || []).map(l => l.trim().split(/\s+/).pop());
+    }
+    function pmapNames() {
+      return (cfg().match(/^policy-map\s+(\S+)/gim) || []).map(l => l.replace(/^policy-map\s+/i,'').trim());
+    }
+    function vrfNames() {
+      return (cfg().match(/^vrf\s+(\S+)/gim) || []).map(l => l.replace(/^vrf\s+/i,'').trim());
+    }
+    function isisProcNames() {
+      return (cfg().match(/^router\s+isis\s+(\S+)/gim) || []).map(l => l.trim().split(/\s+/).pop());
+    }
+    function ospfProcNames() {
+      return (cfg().match(/^router\s+ospf\s+(\S+)/gim) || []).map(l => l.trim().split(/\s+/).pop());
     }
 
     const mode = state && state.configMode;
 
+    // ---- config-if ----
     if (mode === 'if') {
-      if (before.length === 0) return ['ipv4','description','mpls','shutdown','no','exit','end'].filter(c => c.startsWith(last.toLowerCase()));
+      if (before.length === 0) return _fil(['ipv4','ipv6','description','vrf','mpls','prefix-sid','service-policy','shutdown','no','exit','end']);
       const v = before[0];
-      if (v === 'ipv4' && before.length === 1) return ['address'].filter(s => s.startsWith(last.toLowerCase()));
-      if (v === 'no' && before.length === 1) return ['ipv4','description','shutdown'].filter(s => s.startsWith(last.toLowerCase()));
+      if (v === 'ipv4' && before.length === 1) return _fil(['address']);
+      if (v === 'ipv6' && before.length === 1) return _fil(['address']);
+      if (v === 'prefix-sid' && before.length === 1) return _fil(['index']);
+      if (v === 'service-policy' && before.length === 1) return _fil(['input','output']);
+      if (v === 'service-policy' && before.length === 2) return _fil(pmapNames());
+      if (v === 'no' && before.length === 1) return _fil(['ipv4','ipv6','description','vrf','mpls','prefix-sid','service-policy','shutdown']);
+      if (v === 'no' && before[1] === 'service-policy' && before.length === 2) return _fil(['input','output']);
       return [];
     }
 
+    // ---- global config ----
     if (mode === 'global') {
-      if (before.length === 0) return ['interface','hostname','router','no','exit','end'].filter(c => c.startsWith(last.toLowerCase()));
+      if (before.length === 0) return _fil(['interface','hostname','router','vrf','segment-routing','class-map','policy-map','no','exit','end']);
       const v = before[0];
-      if ((v === 'interface'||v==='int') && before.length === 1) {
-        const existing = ifaceNames();
-        const defaults = ['GigabitEthernet0/0/0/0','GigabitEthernet0/0/0/1','GigabitEthernet0/0/0/2','Loopback0'];
-        const all = [...new Set([...existing, ...defaults.filter(d => !existing.some(e => e.toLowerCase() === d.toLowerCase()))])];
-        return all.filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
-      }
-      if (v === 'router' && before.length === 1) return ['bgp', 'isis', 'ospf'].filter(s => s.startsWith(last.toLowerCase()));
-      if (v === 'no' && before.length === 1) return ['interface','router'].filter(s => s.startsWith(last.toLowerCase()));
-      if (v === 'no' && before[1] === 'router' && before.length === 2) return ['bgp', 'isis', 'ospf'].filter(s => s.startsWith(last.toLowerCase()));
+      if ((v === 'interface'||v==='int') && before.length === 1) return _fil(ifaceNamesFull());
+      if (v === 'router' && before.length === 1) return _fil(['bgp','isis','ospf','static']);
+      if (v === 'router' && before[1] === 'isis' && before.length === 2) return _fil([...isisProcNames(),'default']);
+      if (v === 'router' && before[1] === 'ospf' && before.length === 2) return _fil([...ospfProcNames(),'1']);
+      if (v === 'segment-routing' && before.length === 1) return _fil(['srv6','global-block']);
+      if (v === 'segment-routing' && before[1] === 'srv6' && before.length === 2) return _fil(['locators']);
+      if (v === 'class-map' && before.length === 1) return _fil(['match-all','match-any',...cmapNames()]);
+      if (v === 'policy-map' && before.length === 1) return _fil([...pmapNames()]);
+      if (v === 'no' && before.length === 1) return _fil(['interface','router','vrf','segment-routing','class-map','policy-map','hostname']);
+      if (v === 'no' && before[1] === 'router' && before.length === 2) return _fil(['bgp','isis','ospf']);
+      if (v === 'no' && before[1] === 'interface' && before.length === 2) return _fil(ifaceNames());
+      if (v === 'no' && before[1] === 'vrf' && before.length === 2) return _fil(vrfNames());
+      if (v === 'no' && before[1] === 'class-map' && before.length === 2) return _fil(cmapNames());
+      if (v === 'no' && before[1] === 'policy-map' && before.length === 2) return _fil(pmapNames());
       return [];
     }
 
+    // ---- config-router (BGP) ----
     if (mode === 'router') {
-      if (before.length === 0) return ['neighbor','network','bgp','no','exit','end'].filter(c => c.startsWith(last.toLowerCase()));
+      if (before.length === 0) return _fil(['neighbor','network','bgp','no','exit','end']);
       const v = before[0];
-      if (v === 'bgp' && before.length === 1) return ['router-id'].filter(s => s.startsWith(last.toLowerCase()));
-      if (v === 'neighbor' && before.length === 2) return ['remote-as','update-source','description','shutdown'].filter(s => s.startsWith(last.toLowerCase()));
-      if (v === 'no' && before.length === 1) return ['neighbor','network'].filter(s => s.startsWith(last.toLowerCase()));
+      if (v === 'bgp' && before.length === 1) return _fil(['router-id']);
+      if (v === 'neighbor' && before.length === 2) return _fil(['remote-as','update-source','description','shutdown']);
+      if (v === 'no' && before.length === 1) return _fil(['neighbor','network','bgp']);
       return [];
     }
 
+    // ---- config-static ----
+    if (mode === 'static') {
+      if (before.length === 0) return _fil(['address-family','no','exit','end']);
+      const v = before[0];
+      if (v === 'address-family' && before.length === 1) return _fil(['ipv4','ipv6']);
+      if (v === 'address-family' && before.length === 2) return _fil(['unicast']);
+      return [];
+    }
+
+    // ---- config-isis ----
+    if (mode === 'isis') {
+      if (before.length === 0) return _fil(['net','is-type','interface','address-family','segment-routing','no','exit','end']);
+      const v = before[0];
+      if (v === 'is-type' && before.length === 1) return _fil(['level-1','level-1-2','level-2-only']);
+      if (v === 'interface' && before.length === 1) return _fil(ifaceNamesFull());
+      if (v === 'segment-routing' && before.length === 1) return _fil(['mpls']);
+      if (v === 'address-family' && before.length === 1) return _fil(['ipv4','ipv6']);
+      if (v === 'address-family' && before.length === 2) return _fil(['unicast']);
+      if (v === 'no' && before.length === 1) return _fil(['net','is-type','interface','segment-routing']);
+      if (v === 'no' && before[1] === 'interface' && before.length === 2) return _fil(ifaceNames());
+      return [];
+    }
+
+    // ---- config-isis-if ----
+    if (mode === 'isis-if') {
+      if (before.length === 0) return _fil(['point-to-point','passive','metric','address-family','no','exit','end']);
+      const v = before[0];
+      if (v === 'address-family' && before.length === 1) return _fil(['ipv4','ipv6']);
+      if (v === 'no' && before.length === 1) return _fil(['point-to-point','passive','metric']);
+      return [];
+    }
+
+    // ---- config-ospf ----
     if (mode === 'ospf') {
-      if (before.length === 0) return ['area','router-id','no','exit','end'].filter(c => c.startsWith(last.toLowerCase()));
+      if (before.length === 0) return _fil(['router-id','area','no','exit','end']);
       const v = before[0];
-      if (v === 'no' && before.length === 1) return ['area','router-id'].filter(s => s.startsWith(last.toLowerCase()));
+      if (v === 'no' && before.length === 1) return _fil(['router-id','area']);
       return [];
     }
 
+    // ---- config-ospf-area ----
     if (mode === 'ospf-area') {
-      if (before.length === 0) return ['interface','no','exit','end'].filter(c => c.startsWith(last.toLowerCase()));
+      if (before.length === 0) return _fil(['interface','no','exit','end']);
       const v = before[0];
-      if (v === 'interface' && before.length === 1) return ifaceNames().filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
-      if (v === 'no' && before.length === 1) return ['interface'].filter(s => s.startsWith(last.toLowerCase()));
+      if (v === 'interface' && before.length === 1) return _fil(ifaceNamesFull());
+      if (v === 'no' && before.length === 1) return _fil(['interface']);
+      if (v === 'no' && before[1] === 'interface' && before.length === 2) return _fil(ifaceNames());
       return [];
     }
 
+    // ---- config-ospf-if ----
     if (mode === 'ospf-if') {
-      if (before.length === 0) return ['cost','passive','network','no','exit','end'].filter(c => c.startsWith(last.toLowerCase()));
+      if (before.length === 0) return _fil(['cost','passive','network','no','exit','end']);
       const v = before[0];
-      if (v === 'network' && before.length === 1) return ['point-to-point'].filter(s => s.startsWith(last.toLowerCase()));
-      if (v === 'no' && before.length === 1) return ['cost','passive','network'].filter(s => s.startsWith(last.toLowerCase()));
+      if (v === 'network' && before.length === 1) return _fil(['point-to-point']);
+      if (v === 'no' && before.length === 1) return _fil(['cost','passive','network']);
       return [];
     }
 
-    // exec mode
+    // ---- config-vrf ----
+    if (mode === 'vrf') {
+      if (before.length === 0) return _fil(['rd','address-family','import','export','no','exit','end']);
+      const v = before[0];
+      if (v === 'address-family' && before.length === 1) return _fil(['ipv4','ipv6']);
+      if (v === 'address-family' && before.length === 2) return _fil(['unicast']);
+      if ((v === 'import'||v === 'export') && before.length === 1) return _fil(['route-target']);
+      if (v === 'no' && before.length === 1) return _fil(['rd','import','export']);
+      if (v === 'no' && (before[1]==='import'||before[1]==='export') && before.length === 2) return _fil(['route-target']);
+      return [];
+    }
+
+    // ---- config-sr-srv6 ----
+    if (mode === 'sr-srv6') {
+      if (before.length === 0) return _fil(['locators','exit','end']);
+      return [];
+    }
+
+    // ---- config-sr-srv6-locs ----
+    if (mode === 'sr-srv6-locs') {
+      if (before.length === 0) return _fil(['locator','exit','end']);
+      return [];
+    }
+
+    // ---- config-sr-srv6-loc ----
+    if (mode === 'sr-srv6-loc') {
+      if (before.length === 0) return _fil(['prefix','no','exit','end']);
+      const v = before[0];
+      if (v === 'no' && before.length === 1) return _fil(['prefix']);
+      return [];
+    }
+
+    // ---- config-cmap ----
+    if (mode === 'cmap') {
+      if (before.length === 0) return _fil(['match','no','exit','end-class-map','end']);
+      const v = before[0];
+      if (v === 'match' && before.length === 1) return _fil(['dscp','precedence','protocol','access-group','traffic-class']);
+      if (v === 'no' && before.length === 1) return _fil(['match']);
+      if (v === 'no' && before[1] === 'match' && before.length === 2) return _fil(['dscp','precedence','protocol','access-group','traffic-class']);
+      return [];
+    }
+
+    // ---- config-pmap ----
+    if (mode === 'pmap') {
+      if (before.length === 0) return _fil(['class','no','exit','end-policy-map','end']);
+      const v = before[0];
+      if (v === 'class' && before.length === 1) return _fil([...cmapNames(),'class-default']);
+      if (v === 'no' && before.length === 1) return _fil(['class']);
+      if (v === 'no' && before[1] === 'class' && before.length === 2) return _fil([...cmapNames(),'class-default']);
+      return [];
+    }
+
+    // ---- config-pmap-class ----
+    if (mode === 'pmap-class') {
+      if (before.length === 0) return _fil(['priority','bandwidth','police','shape','set','fair-queue','no','exit','end']);
+      const v = before[0];
+      if (v === 'bandwidth' && before.length === 1) return _fil(['percent','remaining']);
+      if (v === 'police' && before.length === 1) return _fil(['rate']);
+      if (v === 'shape' && before.length === 1) return _fil(['average']);
+      if (v === 'set' && before.length === 1) return _fil(['dscp','precedence','traffic-class']);
+      if (v === 'no' && before.length === 1) return _fil(['priority','bandwidth','police','shape','set','fair-queue']);
+      return [];
+    }
+
+    // ---- exec mode ----
     if (before.length === 0) {
-      return ['configure','show','commit','load-config','clear','exit','help']
-        .filter(c => c.startsWith(last.toLowerCase()));
+      return _fil(['configure','show','ping','commit','clear','exit','help']);
     }
     const verb = before[0];
-    if (verb === 'configure' || verb === 'conf') {
-      if (before.length === 1) return ['terminal'].filter(s => s.startsWith(last.toLowerCase()));
-    }
+    if ((verb === 'configure'||verb === 'conf') && before.length === 1) return _fil(['terminal']);
+    if (verb === 'ping' && before.length === 1) return _fil(['ipv6']);
+    if (verb === 'clear' && before.length === 1) return _fil(['bgp','isis','ospf']);
+
     if (verb === 'show' || verb === 'sh') {
-      if (before.length === 1) {
-        return ['bgp','mpls','route','interfaces','running-config','startup-config','version','arp','isis','ospf']
-          .filter(s => s.startsWith(last.toLowerCase()));
-      }
+      if (before.length === 1) return _fil(['running-config','startup-config','version','interfaces','ip','ipv6','bgp','route','arp','isis','ospf','vrf','mpls','segment-routing','class-map','policy-map']);
       const sub = before[1];
-      if (sub === 'bgp' && before.length === 2) return ['summary'].filter(s => s.startsWith(last.toLowerCase()));
-      if (sub === 'interfaces' && before.length === 2) return ['brief',...ifaceNames()].filter(s => s.toLowerCase().startsWith(last.toLowerCase()));
-      if (sub === 'ospf' && before.length === 2) return ['neighbor','database'].filter(s => s.startsWith(last.toLowerCase()));
-    }
-    if (verb === 'write' || verb === 'wr') {
-      if (before.length === 1) return ['memory'].filter(s => s.startsWith(last.toLowerCase()));
+      if (sub === 'ip' && before.length === 2) return _fil(['interface','bgp','route']);
+      if (sub === 'ip' && before[2] === 'interface' && before.length === 3) return _fil(['brief',...ifaceNames()]);
+      if (sub === 'ipv6' && before.length === 2) return _fil(['interface','route','neighbors']);
+      if (sub === 'interfaces' && before.length === 2) return _fil(['brief',...ifaceNames()]);
+      if (sub === 'bgp' && before.length === 2) return _fil(['summary']);
+      if (sub === 'route' && before.length === 2) return _fil(['ipv4','ipv6']);
+      if (sub === 'isis' && before.length === 2) return _fil(['neighbor','topology','database']);
+      if (sub === 'ospf' && before.length === 2) return _fil(['neighbor','database']);
+      if (sub === 'mpls' && before.length === 2) return _fil(['forwarding-table','ldp']);
+      if (sub === 'mpls' && before[2] === 'ldp' && before.length === 3) return _fil(['neighbor','bindings','forwarding-table']);
+      if (sub === 'segment-routing' && before.length === 2) return _fil(['mpls','srv6']);
+      if (sub === 'segment-routing' && before[2] === 'mpls' && before.length === 3) return _fil(['forwarding','lb']);
+      if (sub === 'segment-routing' && before[2] === 'srv6' && before.length === 3) return _fil(['locators','sids']);
+      if (sub === 'vrf' && before.length === 2) return _fil(['all',...vrfNames()]);
+      if (sub === 'class-map' && before.length === 2) return _fil(cmapNames());
+      if (sub === 'policy-map' && before.length === 2) return _fil(['interface',...pmapNames()]);
+      if (sub === 'policy-map' && before[2] === 'interface' && before.length === 3) return _fil(ifaceNames());
     }
     return [];
   }
