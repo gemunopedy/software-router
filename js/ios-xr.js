@@ -190,12 +190,40 @@
   }
 
   function getMplsConfig(cfg) {
+    // 新形式: mpls ldp ブロックを優先解析
+    const ldpBlock = _parseMplsLdpBlock(cfg);
+    if (ldpBlock.interfaces.length > 0) {
+      return {
+        interfaces: ldpBlock.interfaces.map(n => ({ name: n, mplsEnabled: true, ldpEnabled: true })),
+        ldpRouterId: ldpBlock.routerId,
+      };
+    }
+    // 旧形式: interface ブロック内の `mpls` キーワード (後方互換)
     const ifaces = parseInterfaces(cfg);
     const mplsIfaces = ifaces
       .filter(blk => blk.lines.some(l => /^mpls\s*$/i.test(l) || /^mpls ip\s*$/i.test(l)))
       .map(blk => ({ name: blk.name, mplsEnabled: true, ldpEnabled: true }));
     if (!mplsIfaces.length) return null;
     return { interfaces: mplsIfaces, ldpRouterId: null };
+  }
+
+  function _parseMplsLdpBlock(cfg) {
+    const lines = (cfg || '').split('\n');
+    const result = { interfaces: [], routerId: null };
+    let inBlock = false, depth = 0;
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (/^mpls\s+ldp\s*$/i.test(t)) { inBlock = true; depth = 0; continue; }
+      if (!inBlock) continue;
+      if (t !== '' && !/^[ \t]/.test(t)) { inBlock = false; continue; }
+      const tr = t.trim();
+      if (!tr || tr === '!') continue;
+      const ridM = tr.match(/^router-id\s+([\d.]+)/i);
+      if (ridM) { result.routerId = ridM[1]; continue; }
+      const ifM = tr.match(/^interface\s+(\S+)/i);
+      if (ifM && !result.interfaces.includes(ifM[1])) result.interfaces.push(ifM[1]);
+    }
+    return result;
   }
 
   // --- SRv6 設定パーサ ---
@@ -1084,7 +1112,55 @@
     Storage.write(router.id, 'running', out.join('\n'));
   }
 
-  const showHandlers = {};
+  function _updateMplsLdpLine(router, matchRe, newLine) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const blockRe = /^mpls\s+ldp\s*$/i;
+    if (!blockRe.test(cfg)) {
+      Storage.write(router.id, 'running', (cfg.trimEnd() + `\nmpls ldp\n ${newLine}\n`));
+      return;
+    }
+    const lines = cfg.split('\n');
+    let inBlock = false, replaced = false;
+    const out = [];
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (blockRe.test(t)) { inBlock = true; out.push(t); continue; }
+      if (inBlock) {
+        if (t !== '' && !/^[ \t]/.test(t)) {
+          if (!replaced) { out.push(` ${newLine}`); replaced = true; }
+          inBlock = false;
+        } else if (matchRe.test(t.trim())) {
+          out.push(` ${newLine}`); replaced = true; continue;
+        }
+      }
+      out.push(t);
+    }
+    if (!replaced) out.push(` ${newLine}`);
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  function _removeMplsLdpLine(router, matchRe) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const blockRe = /^mpls\s+ldp\s*$/i;
+    let inBlock = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (blockRe.test(t)) { inBlock = true; return true; }
+      if (inBlock) {
+        if (t !== '' && !/^[ \t]/.test(t)) { inBlock = false; return true; }
+        if (matchRe.test(t.trim())) return false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  function _removeMplsLdpBlock(router) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    Storage.write(router.id, 'running',
+      cfg.replace(/^mpls\s+ldp\s*\n(?:[ \t]+.*\n)*/im, ''));
+  }
+
 
   showHandlers['running-config'] = showHandlers['run'] = (args, router, io) => {
     const cfg = Storage.read(router.id, 'running') || '';
@@ -1437,7 +1513,7 @@
     if (!window.RouterMpls) { io.println('% MPLS not initialized'); return; }
     const sub = _ex(args[0], ['ldp', 'forwarding']);
     if (sub === 'ldp') {
-      const sub2 = _ex(args[1], ['neighbor', 'bindings']);
+      const sub2 = _ex(args[1], ['neighbor', 'bindings', 'forwarding-table']);
       if (sub2 === 'neighbor' || !args[1]) {
         const neighbors = window.RouterMpls.getNeighbors(router.id);
         if (neighbors.length === 0) { io.println('    (no LDP neighbors)'); return; }
@@ -1447,34 +1523,57 @@
         const lo = ifList.find(b => /^loopback0$/i.test(b.name));
         if (lo) { const ipInfo = getIfIpInfo(lo); myLdp = ipInfo ? ipInfo.ip : null; }
         if (!myLdp) {
+          const ldpBl = _parseMplsLdpBlock(cfg);
+          myLdp = ldpBl.routerId;
+        }
+        if (!myLdp) {
           const first = ifList.find(b => getIfIpInfo(b));
-          if (first) { const ipInfo = getIfIpInfo(first); myLdp = ipInfo ? ipInfo.ip : router.id; }
-          else myLdp = router.id;
+          myLdp = first ? getIfIpInfo(first).ip : router.id;
         }
         neighbors.forEach(n => {
-          const peerLdp = n.ldpId;
-          io.println(`    Peer LDP Ident: ${peerLdp}; Local LDP Ident ${myLdp}:0`);
-          io.println(`        TCP connection: ${peerLdp.replace(':0','')}.646 - ${myLdp}.59000`);
-          io.println(`        State: Oper; Msgs sent/rcvd: 12/12`);
-          io.println(`        Up time: ${n.uptime}`);
-          io.println(`        LDP discovery sources:`);
-          io.println(`          ${n.iface}, Src IP addr: ${n.neighborIp}`);
+          const peerIp = n.neighborIp || n.ldpId.replace(':0','');
+          io.println(`Peer LDP Identifier: ${n.ldpId}`);
+          io.println(`  TCP connection: ${peerIp}:646 - ${myLdp}:12345`);
+          io.println(`  Graceful Restart: No`);
+          io.println(`  Session Holdtime: 180 sec`);
+          io.println(`  State: Oper; Msgs sent/rcvd: 12/12; Downstream-Unsolicited`);
+          io.println(`  Up time: ${n.uptime}`);
+          io.println(`  LDP Discovery Sources:`);
+          io.println(`    ${n.iface}`);
+          io.println(`    Addresses bound to this peer:`);
+          io.println(`      ${peerIp}`);
+          io.println('');
         });
         return;
       }
       if (sub2 === 'bindings') {
         const bindings = window.RouterMpls.getBindings(router.id);
         if (bindings.length === 0) { io.println('    (no LDP bindings)'); return; }
+        io.println('');
         bindings.forEach(b => {
-          io.println(`  ${b.fec}, rev 2`);
-          io.println(`        Local binding: label: ${b.localLabel}`);
+          io.println(`  lib entry: ${b.fec}, rev 2`);
+          io.println(`        local binding:  label: ${b.localLabel}`);
           if (b.remoteBindings.length > 0) {
-            io.println(`        Remote bindings: (${b.remoteBindings.length} peer)`);
-            io.println(`            Peer        Label`);
-            b.remoteBindings.forEach(r => {
-              io.println(`            ${r.lsr.padEnd(12)}${r.label}`);
+            io.println(`        remote binding: lsr: ${b.remoteBindings[0].lsr}, label: ${b.remoteBindings[0].label}`);
+            b.remoteBindings.slice(1).forEach(r => {
+              io.println(`        remote binding: lsr: ${r.lsr}, label: ${r.label}`);
             });
           }
+          io.println('');
+        });
+        return;
+      }
+      if (sub2 === 'forwarding-table') {
+        const table = window.RouterMpls.getForwardingTable(router.id);
+        io.println('Local  Outgoing    Prefix            Next Hop        Interface');
+        io.println('Label  Label       or ID');
+        if (table.length === 0) { io.println('  (empty)'); return; }
+        table.forEach(e => {
+          const loc = String(e.inLabel).padEnd(7);
+          const out = e.outLabel.padEnd(12);
+          const pref = e.prefix.padEnd(18);
+          const nh = (e.nexthop || '').padEnd(16);
+          io.println(`${loc}${out}${pref}${nh}${e.iface || '-'}`);
         });
         return;
       }
@@ -1483,15 +1582,15 @@
     }
     if (sub === 'forwarding') {
       const table = window.RouterMpls.getForwardingTable(router.id);
-      io.println('Local  Outgoing    Prefix            Interface       Next Hop');
-      io.println('Label  Label                         or ID');
+      io.println('Local  Outgoing    Prefix            Next Hop        Interface');
+      io.println('Label  Label       or ID');
       if (table.length === 0) { io.println('  (empty)'); return; }
       table.forEach(e => {
         const loc = String(e.inLabel).padEnd(7);
         const out = e.outLabel.padEnd(12);
         const pref = e.prefix.padEnd(18);
-        const iface = (e.iface || '-').padEnd(16);
-        io.println(`${loc}${out}${pref}${iface}${e.nexthop}`);
+        const nh = (e.nexthop || '').padEnd(16);
+        io.println(`${loc}${out}${pref}${nh}${e.iface || '-'}`);
       });
       return;
     }
@@ -1830,6 +1929,8 @@
           } else if (state.configMode === 'sr-srv6-locs') {
             state.configMode = 'sr-srv6';
           } else if (state.configMode === 'sr-srv6') {
+            state.configMode = 'global';
+          } else if (state.configMode === 'mpls-ldp') {
             state.configMode = 'global';
           } else if (state.configMode === 'pim-af') {
             state.configMode = 'pim';
@@ -2397,6 +2498,39 @@
 
       // ---------- global config ----------
 
+      // ---------- config-mpls-ldp モード ----------
+      if (state.configMode === 'mpls-ldp') {
+        if (verb === 'router-id') {
+          const rid = parts[1];
+          if (!rid) { io.println('% Incomplete command.'); return true; }
+          _updateMplsLdpLine(router, /^router-id\s+/i, `router-id ${rid}`);
+          if (window.RouterMpls) window.RouterMpls.recalculate(router.id);
+          return true;
+        }
+        if (verb === 'interface' || verb === 'int') {
+          const ifName = parts[1];
+          if (!ifName) { io.println('% Incomplete command.'); return true; }
+          _updateMplsLdpLine(router, new RegExp(`^interface\\s+${ifName.replace(/[-/]/g,'[-\\/]')}\\b`, 'i'), `interface ${ifName}`);
+          if (window.RouterMpls) window.RouterMpls.recalculate(router.id);
+          return true;
+        }
+        if (verb === 'no') {
+          const sub = _ex(parts[1], ['router-id','interface']);
+          if (sub === 'router-id') {
+            _removeMplsLdpLine(router, /^router-id\s+/i);
+            if (window.RouterMpls) window.RouterMpls.recalculate(router.id);
+            return true;
+          }
+          if (sub === 'interface' && parts[2]) {
+            _removeMplsLdpLine(router, new RegExp(`^interface\\s+${parts[2].replace(/[-/]/g,'[-\\/]')}\\b`, 'i'));
+            if (window.RouterMpls) window.RouterMpls.recalculate(router.id);
+            return true;
+          }
+        }
+        io.println(`% Invalid input in config-mpls-ldp: ${parts.join(' ')}`);
+        return true;
+      }
+
       // ---------- config-pim モード ----------
       if (state.configMode === 'pim') {
         if (verb === 'address-family') {
@@ -2524,6 +2658,22 @@
         if (!proc) { io.println('% Incomplete command.'); return true; }
         _removeOspfBlock(router, proc);
         RouterOspf.recalculate(router.id);
+        return true;
+      }
+
+      // mpls ldp
+      if (verb === 'mpls' && (parts[1]||'').toLowerCase() === 'ldp') {
+        const cfg = Storage.read(router.id, 'running') || '';
+        if (!/^mpls\s+ldp\s*$/im.test(cfg)) {
+          Storage.write(router.id, 'running', cfg.trimEnd() + '\nmpls ldp\n');
+        }
+        state.configMode = 'mpls-ldp';
+        return true;
+      }
+      // no mpls ldp
+      if (verb === 'no' && (parts[1]||'').toLowerCase() === 'mpls' && (parts[2]||'').toLowerCase() === 'ldp') {
+        _removeMplsLdpBlock(router);
+        if (window.RouterMpls) window.RouterMpls.recalculate(router.id);
         return true;
       }
 
@@ -2911,18 +3061,20 @@
 
     // ---- global config ----
     if (mode === 'global') {
-      if (before.length === 0) return _fil(['interface','hostname','router','vrf','segment-routing','class-map','policy-map','no','exit','end']);
+      if (before.length === 0) return _fil(['interface','hostname','router','mpls','vrf','segment-routing','class-map','policy-map','no','exit','end']);
       const v = before[0];
       if ((v === 'interface'||v==='int') && before.length === 1) return _fil(ifaceNamesFull());
-      if (v === 'router' && before.length === 1) return _fil(['bgp','isis','ospf','static']);
+      if (v === 'router' && before.length === 1) return _fil(['bgp','isis','ospf','static','pim']);
       if (v === 'router' && before[1] === 'isis' && before.length === 2) return _fil([...isisProcNames(),'default']);
       if (v === 'router' && before[1] === 'ospf' && before.length === 2) return _fil([...ospfProcNames(),'1']);
+      if (v === 'mpls' && before.length === 1) return _fil(['ldp']);
       if (v === 'segment-routing' && before.length === 1) return _fil(['srv6','global-block']);
       if (v === 'segment-routing' && before[1] === 'srv6' && before.length === 2) return _fil(['locators']);
       if (v === 'class-map' && before.length === 1) return _fil(['match-all','match-any',...cmapNames()]);
       if (v === 'policy-map' && before.length === 1) return _fil([...pmapNames()]);
-      if (v === 'no' && before.length === 1) return _fil(['interface','router','vrf','segment-routing','class-map','policy-map','hostname']);
-      if (v === 'no' && before[1] === 'router' && before.length === 2) return _fil(['bgp','isis','ospf']);
+      if (v === 'no' && before.length === 1) return _fil(['interface','router','mpls','vrf','segment-routing','class-map','policy-map','hostname']);
+      if (v === 'no' && before[1] === 'router' && before.length === 2) return _fil(['bgp','isis','ospf','pim']);
+      if (v === 'no' && before[1] === 'mpls' && before.length === 2) return _fil(['ldp']);
       if (v === 'no' && before[1] === 'interface' && before.length === 2) return _fil(ifaceNames());
       if (v === 'no' && before[1] === 'vrf' && before.length === 2) return _fil(vrfNames());
       if (v === 'no' && before[1] === 'class-map' && before.length === 2) return _fil(cmapNames());
@@ -3060,6 +3212,17 @@
       if (v === 'shape' && before.length === 1) return _fil(['average']);
       if (v === 'set' && before.length === 1) return _fil(['dscp','precedence','traffic-class']);
       if (v === 'no' && before.length === 1) return _fil(['priority','bandwidth','police','shape','set','fair-queue']);
+      return [];
+    }
+
+    // ---- config-mpls-ldp ----
+    if (mode === 'mpls-ldp') {
+      if (before.length === 0) return _fil(['router-id','interface','no','exit','end']);
+      const v = before[0];
+      if (v === 'router-id' && before.length === 1) return _fil(ifaceNamesFull().concat(['Loopback0']));
+      if (v === 'interface' && before.length === 1) return _fil(ifaceNamesFull());
+      if (v === 'no' && before.length === 1) return _fil(['router-id','interface']);
+      if (v === 'no' && before[1] === 'interface' && before.length === 2) return _fil(ifaceNamesFull());
       return [];
     }
 
