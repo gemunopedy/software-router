@@ -695,6 +695,8 @@
     });
     Storage.write(router.id, 'running', out.join('\n'));
   }
+
+  function _updateVrfLine(router, vrfName, matchRe, newLine) {
     const cfg = Storage.read(router.id, 'running') || '';
     const headerRe = new RegExp(`^vrf\\s+${vrfName.replace(/[-/]/g, '[-\\/]')}\\s*$`, 'i');
     const lines = cfg.split('\n');
@@ -1035,44 +1037,64 @@
     io.println('!');
     io.println(`hostname ${host}`);
     io.println('!');
-    // class-map / policy-map グローバルブロックを interface より前に出力
-    const classMaps = RouterQos.parseClassMaps(cfg);
-    const policyMaps = RouterQos.parsePolicyMaps(cfg);
-    for (const cm of classMaps) {
-      io.println(`class-map ${cm.matchType} ${cm.name}`);
-      for (const m of cm.matches) io.println(` match ${m.type} ${m.value}`);
-      io.println('!');
-    }
-    for (const pm of policyMaps) {
-      io.println(`policy-map ${pm.name}`);
-      for (const cls of pm.classes) {
-        io.println(` class ${cls.name}`);
-        for (const a of cls.actions) io.println(`  ${a.raw}`);
+
+    // running config をトップレベルブロック単位でパース
+    // ブロック = col0 から始まる行 + その後の字下げ行の集合
+    const _parseBlocks = (text) => {
+      const blocks = [];
+      let cur = null;
+      for (const raw of text.split('\n')) {
+        const t = raw.trimEnd();
+        if (!t || t === '!') { if (cur) { blocks.push(cur); cur = null; } continue; }
+        if (/^hostname\s/i.test(t)) continue; // 先頭で出力済み
+        if (!/^[ \t]/.test(t)) {
+          if (cur) blocks.push(cur);
+          cur = { header: t, lines: [] };
+        } else if (cur) {
+          cur.lines.push(t);
+        }
       }
+      if (cur) blocks.push(cur);
+      return blocks;
+    };
+
+    const _blockOrder = (hdr) => {
+      if (/^vrf\s/i.test(hdr))              return 0;
+      if (/^class-map\s/i.test(hdr))        return 1;
+      if (/^policy-map\s/i.test(hdr))       return 2;
+      if (/^interface\s/i.test(hdr))        return 3;
+      if (/^router\s+static\b/i.test(hdr))  return 4;
+      if (/^router\s+bgp\b/i.test(hdr))     return 5;
+      if (/^router\s+isis\b/i.test(hdr))    return 6;
+      if (/^router\s+ospf\b/i.test(hdr))    return 7;
+      if (/^segment-routing\b/i.test(hdr))  return 8;
+      if (/^mpls\b/i.test(hdr))             return 9;
+      return 10;
+    };
+
+    const _printBlock = (blk) => {
+      io.println(blk.header);
+      for (const l of blk.lines) { if (l.trim()) io.println(l); }
       io.println('!');
-    }
-    const ifaces = parseInterfaces(cfg);
-    ifaces.sort((a, b) => /^loopback/i.test(a.name) ? -1 : /^loopback/i.test(b.name) ? 1 : 0);
-    ifaces.forEach(blk => {
-      io.println(`interface ${blk.name}`);
-      blk.lines.forEach(l => { if (l.trim() !== '') io.println(' ' + l); });
-      io.println('!');
+    };
+
+    const blocks = _parseBlocks(cfg);
+
+    // interface ブロックは Loopback 優先でソート
+    blocks.sort((a, b) => {
+      const ao = _blockOrder(a.header), bo = _blockOrder(b.header);
+      if (ao !== bo) return ao - bo;
+      if (ao === 3) { // interface
+        const aLo = /^interface\s+loopback/i.test(a.header);
+        const bLo = /^interface\s+loopback/i.test(b.header);
+        if (aLo && !bLo) return -1;
+        if (!aLo && bLo) return 1;
+        return a.header.localeCompare(b.header);
+      }
+      return 0;
     });
-    // router blocks
-    const lines = cfg.split('\n');
-    let inRouter = false;
-    const routerLines = [];
-    for (const l of lines) {
-      if (/^router\s+\S+/i.test(l)) { inRouter = true; routerLines.push(l); continue; }
-      if (inRouter) {
-        if (l !== '' && !/^[ \t!]/.test(l)) { inRouter = false; }
-        else routerLines.push(l);
-      }
-    }
-    if (routerLines.length) {
-      routerLines.forEach(l => { if (l.trim() !== '') io.println(l); });
-      io.println('!');
-    }
+
+    for (const blk of blocks) _printBlock(blk);
     io.println('end');
     io.println('');
   };
