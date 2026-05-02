@@ -2700,7 +2700,12 @@
     if (mode === 'global') {
       if (before.length === 0) return ['interface','hostname','router','no','exit','end'].filter(c => c.startsWith(last.toLowerCase()));
       const v = before[0];
-      if ((v === 'interface'||v==='int') && before.length === 1) return ifaceNames().filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
+      if ((v === 'interface'||v==='int') && before.length === 1) {
+        const existing = ifaceNames();
+        const defaults = ['GigabitEthernet1','GigabitEthernet2','GigabitEthernet3','Loopback0'];
+        const all = [...new Set([...existing, ...defaults.filter(d => !existing.some(e => e.toLowerCase() === d.toLowerCase()))])];
+        return all.filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
+      }
       if (v === 'router' && before.length === 1) return ['bgp', 'isis', 'ospf'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'no' && before.length === 1) return ['interface','router'].filter(s => s.startsWith(last.toLowerCase()));
       if (v === 'no' && before[1] === 'router' && before.length === 2) return ['bgp', 'isis', 'ospf'].filter(s => s.startsWith(last.toLowerCase()));

@@ -24,7 +24,7 @@
 
   function defaultConfigFor(id, os) {
     if (os === 'ios-xr') {
-      return `hostname ${id}\ninterface GigabitEthernet0/0\n ipv4 address 10.0.0.1/24\n!\n`;
+      return `hostname ${id}\ninterface GigabitEthernet1\n ipv4 address 10.0.0.1/24\n!\n`;
     }
     if (os === 'junos') {
       return [
@@ -49,11 +49,10 @@
   function nextPort(topology, nodeId) {
     // そのノードを使っているリンク数からポート番号を割り振る
     const used = topology.links.filter(l => l.a === nodeId || l.b === nodeId).length;
-    // ios-xe: GigabitEthernetN 形式 (1-based), それ以外: Gi0/N 形式
     const node = topology.nodes.find(n => n.id === nodeId);
-    const isXe = node && node.os === 'ios-xe';
-    if (isXe) return `Gi${used + 1}`;
-    return `Gi0/${used}`;
+    if (node && node.os === 'junos') return `ge-0/0/${used}`;
+    // ios-xe / ios-xr: GigabitEthernetN 形式 (1-based)
+    return `GigabitEthernet${used + 1}`;
   }
 
   function create(opts) {
