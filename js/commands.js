@@ -121,6 +121,8 @@
       if (state && state.configMode === 'cmap')       return 'RP/0/RP0/CPU0:' + host + '(config-cmap)# ';
       if (state && state.configMode === 'pmap')       return 'RP/0/RP0/CPU0:' + host + '(config-pmap)# ';
       if (state && state.configMode === 'pmap-class') return 'RP/0/RP0/CPU0:' + host + '(config-pmap-c)# ';
+      if (state && state.configMode === 'pim')        return 'RP/0/RP0/CPU0:' + host + '(config-pim)# ';
+      if (state && state.configMode === 'pim-af')     return 'RP/0/RP0/CPU0:' + host + '(config-pim-af)# ';
       if (state && state.configMode === 'global')     return 'RP/0/RP0/CPU0:' + host + '(config)# ';
       return 'RP/0/RP0/CPU0:' + host + '# ';
     }

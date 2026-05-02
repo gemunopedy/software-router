@@ -268,7 +268,7 @@
 
   // show ip interface brief
   showHandlers['ip'] = (args, router, io) => {
-    const sub = _ex(args[0], ['interface','route','bgp','ospf','vrf']);
+    const sub = _ex(args[0], ['interface','route','bgp','ospf','vrf','mroute','pim']);
     const cfg = readCfg(router);
 
     if (sub === 'interface' && (args[1] || '').match(/^br/i)) {
@@ -395,6 +395,72 @@
 
     if (sub === 'vrf') {
       showHandlers['vrf'](args.slice(1), router, io);
+      return;
+    }
+
+    if (sub === 'mroute') {
+      const mrib = window.RouterMulticast ? window.RouterMulticast.getMrib(router.id) : [];
+      io.println('IP Multicast Routing Table');
+      io.println('Flags: D - Dense, S - Sparse, B - Bidir Group, s - SSM Group, C - Connected,');
+      io.println('       L - Local, P - Pruned, R - RP-bit set, F - Register flag,');
+      io.println('       T - SPT-bit set, J - Join SPT, M - MSDP created entry,');
+      io.println('       X - Proxy Join Timer Running, A - Candidate for MSDP Advertisement,');
+      io.println('       U - URD, I - Received Source Specific Host Report,');
+      io.println('       Z - Multicast Tunnel, z - MDT-data group sender,');
+      io.println('       Y - Joined MDT-data group, y - Sending to MDT-data group');
+      io.println('');
+      if (mrib.length === 0) {
+        io.println('(No entries in the multicast routing table)');
+      } else {
+        for (const entry of mrib) {
+          io.println(`(*,${entry.group}), RP is ${entry.rp}, flags: SP`);
+          io.println(`  Incoming interface: ${entry.iif || 'Null'}, RPF nbr ${entry.rp}`);
+          io.println(`  Outgoing interface list:`);
+          if (entry.oifList.length === 0) {
+            io.println('    Null');
+          } else {
+            entry.oifList.forEach(oif => io.println(`    ${oif}, Forward/Sparse, 0:00:00/00:00:00`));
+          }
+          io.println('');
+        }
+      }
+      return;
+    }
+
+    if (sub === 'pim') {
+      const sub2 = (args[1] || '').toLowerCase();
+      if (sub2.startsWith('neighbor') || sub2 === 'nbr') {
+        const neighbors = window.RouterMulticast ? window.RouterMulticast.getPimNeighbors(router.id) : [];
+        io.println('PIM Neighbor Table');
+        io.println('Mode: B - Bidir Capable, DR - Designated Router, N - Default DR Priority,');
+        io.println('      P - Proxy Capable, S - State Refresh Capable, G - GenID Capable');
+        io.println('');
+        io.println('Neighbor          Interface                Uptime/Expires    Ver   DR');
+        io.println('Address                                                             Prio/Mode');
+        for (const n of neighbors) {
+          const sec = Math.floor((Date.now() - n.establishedAt) / 1000);
+          const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+          const uptime = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+          io.println(`${(n.neighborIp||n.neighborId).padEnd(18)}${n.localIface.padEnd(25)}${uptime}/00:01:30  v2    1 / DR`);
+        }
+        return;
+      }
+      if (sub2.startsWith('rp')) {
+        const rpMappings = window.RouterMulticast ? window.RouterMulticast.getRpMappings(router.id) : [];
+        io.println('PIM Group-to-RP Mappings');
+        io.println('');
+        if (rpMappings.length === 0) {
+          io.println('This system is not configured as a candidate RP.');
+        } else {
+          for (const m of rpMappings) {
+            io.println(`Group(s): ${m.groupPrefix}/${m.groupPrefixLen}`);
+            io.println(`  RP: ${m.rpIp}`);
+            io.println('    Info source: Static, via sparse-mode, priority 0, holdtime 0');
+          }
+        }
+        return;
+      }
+      io.println(`% Invalid input after 'show ip pim'`);
       return;
     }
 
@@ -1935,6 +2001,19 @@
           return true;
         }
 
+        // ip pim sparse-mode
+        if (verb === 'ip' && (parts[1]||'').toLowerCase() === 'pim' && (parts[2]||'').toLowerCase().startsWith('sparse')) {
+          _updateIfaceLine(router, ifaceName, /^ip\s+pim\s+sparse-mode/i, 'ip pim sparse-mode');
+          if (window.RouterMulticast) window.RouterMulticast.recalculate();
+          return true;
+        }
+        // no ip pim sparse-mode
+        if (verb === 'no' && (parts[1]||'').toLowerCase() === 'ip' && (parts[2]||'').toLowerCase() === 'pim') {
+          _removeIfaceLine(router, ifaceName, /^ip\s+pim\s+sparse-mode/i);
+          if (window.RouterMulticast) window.RouterMulticast.recalculate();
+          return true;
+        }
+
         io.println(`% Invalid input in config-if mode: ${parts.join(' ')}`);
         return true;
       }
@@ -2624,6 +2703,41 @@
         return true;
       }
 
+      // ip multicast-routing
+      if (verb === 'ip' && (parts[1]||'').toLowerCase() === 'multicast-routing') {
+        const cfg = readCfg(router);
+        if (!/^ip\s+multicast-routing/im.test(cfg)) {
+          Storage.write(router.id, 'running', cfg.trimEnd() + '\nip multicast-routing\n');
+        }
+        if (window.RouterMulticast) window.RouterMulticast.recalculate();
+        return true;
+      }
+      // no ip multicast-routing
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'ip' && (parts[2]||'').toLowerCase() === 'multicast-routing') {
+        Storage.write(router.id, 'running', readCfg(router).replace(/^ip\s+multicast-routing\s*\n/im, ''));
+        if (window.RouterMulticast) window.RouterMulticast.recalculate();
+        return true;
+      }
+      // ip pim rp-address <ip> [<group>/<len>]
+      if (verb === 'ip' && (parts[1]||'').toLowerCase() === 'pim' && (parts[2]||'').toLowerCase() === 'rp-address') {
+        const rpIp = parts[3];
+        if (!rpIp) { io.println('% Incomplete command.'); return true; }
+        const cfg = readCfg(router);
+        const line = parts[4] ? `ip pim rp-address ${rpIp} ${parts[4]}` : `ip pim rp-address ${rpIp}`;
+        const updatedCfg = /^ip\s+pim\s+rp-address\s+/im.test(cfg)
+          ? cfg.replace(/^ip\s+pim\s+rp-address\s+.*/im, line)
+          : cfg.trimEnd() + '\n' + line + '\n';
+        Storage.write(router.id, 'running', updatedCfg);
+        if (window.RouterMulticast) window.RouterMulticast.recalculate();
+        return true;
+      }
+      // no ip pim rp-address
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname','ip']) === 'ip' && (parts[2]||'').toLowerCase() === 'pim' && (parts[3]||'').toLowerCase() === 'rp-address') {
+        Storage.write(router.id, 'running', readCfg(router).replace(/^ip\s+pim\s+rp-address\s+.*\n/im, ''));
+        if (window.RouterMulticast) window.RouterMulticast.recalculate();
+        return true;
+      }
+
       io.println(`% Invalid input in config mode: ${parts.join(' ')}`);
       return true;
     }
@@ -3125,8 +3239,35 @@
     });
   }
 
+  // Multicast パーサ登録
+  if (window.RouterMulticast) {
+    window.RouterMulticast.registerOsParser('ios-xe', {
+      getMulticastConfig(cfg) {
+        const enabled = /^ip\s+multicast-routing\s*$/im.test(cfg);
+        const ifaces = parseInterfaces(cfg).filter(blk => blk.lines.some(l => /^ip\s+pim\s+sparse-mode/i.test(l)));
+        const interfaces = ifaces.map(blk => ({ name: blk.name, mode: 'sparse' }));
+        const rpMappings = [];
+        const rpRe = /^ip\s+pim\s+rp-address\s+([\d.]+)(?:\s+([\d.]+\/[\d]+))?/gim;
+        let m;
+        while ((m = rpRe.exec(cfg || ''))) {
+          const rpIp = m[1];
+          const gr = m[2] ? m[2].split('/') : ['224.0.0.0', '4'];
+          rpMappings.push({ rpIp, groupPrefix: gr[0], groupPrefixLen: parseInt(gr[1], 10) });
+        }
+        return { enabled, interfaces, rpMappings };
+      },
+      getInterfaceList(cfg) {
+        return parseInterfaces(cfg).map(blk => ({
+          name: blk.name,
+          ip: getIfaceIp(blk),
+          mask: getIfaceMask(blk),
+        })).filter(f => f.ip);
+      },
+    });
+  }
+
   // すべての OS パーサが登録されたあとに IS-IS / OSPF / MPLS / SR / SRv6 ルートを復元する
-  setTimeout(() => { RouterIsis.restoreAll(); RouterOspf.restoreAll(); if (window.RouterMpls) window.RouterMpls.restoreAll(); if (window.RouterSr) window.RouterSr.restoreAll(); if (window.RouterSrv6) window.RouterSrv6.restoreAll(); }, 0);
+  setTimeout(() => { RouterIsis.restoreAll(); RouterOspf.restoreAll(); if (window.RouterMpls) window.RouterMpls.restoreAll(); if (window.RouterSr) window.RouterSr.restoreAll(); if (window.RouterSrv6) window.RouterSrv6.restoreAll(); if (window.RouterMulticast) window.RouterMulticast.restoreAll(); }, 0);
 
   // IPv6 パーサ登録
   if (window.RouterIpv6) {

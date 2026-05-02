@@ -108,6 +108,7 @@
             configCmap:      state.configCmap      || null,
             configPmap:      state.configPmap      || null,
             configPmapClass: state.configPmapClass || null,
+            configPimProc:   state.configPimProc   || null,
           }));
         } catch (_) {}
       }
@@ -118,6 +119,7 @@
       state.configCmap      = savedState.configCmap      || null;
       state.configPmap      = savedState.configPmap      || null;
       state.configPmapClass = savedState.configPmapClass || null;
+      state.configPimProc   = savedState.configPimProc   || null;
 
       const session = {
         router, term, fit, pane, tab: null, state, io,

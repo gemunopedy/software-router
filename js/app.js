@@ -83,7 +83,7 @@
     topology,
     getSelectedRouter: () => tm.getActiveId(),
     onRouterSelect: (id) => ensureTab(id),
-    onTopologyChange: (t) => { Storage.saveTopology(t); },
+    onTopologyChange: (t) => { Storage.saveTopology(t); if (window.RouterMulticast) window.RouterMulticast.recalculate(); },
     onNodeContextMenu: (id, ev) => showNodeMenu(id, ev),
     onNodeCreated: (node) => {
       Storage.write(node.id, 'startup', node.defaultConfig || '');

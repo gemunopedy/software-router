@@ -1025,6 +1025,65 @@
 
   // ---- show コマンド ----
 
+  // PIM af-config line helpers (router pim / address-family ipv4 block)
+  function _updatePimAfLine(router, matchRe, newLine) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const pimHeaderRe = /^router\s+pim\s*$/i;
+    const afHeaderRe = /^address-family\s+ipv4\s*$/i;
+    if (!pimHeaderRe.test(cfg)) {
+      Storage.write(router.id, 'running', (cfg.trimEnd() + `\nrouter pim\n address-family ipv4\n  ${newLine}\n`));
+      return;
+    }
+    const lines = cfg.split('\n');
+    let inPim = false, inAf = false, replaced = false;
+    const out = [];
+    for (const raw of lines) {
+      const t = raw.trimEnd();
+      if (pimHeaderRe.test(t)) { inPim = true; out.push(t); continue; }
+      if (inPim && !inAf) {
+        if (t !== '' && !/^[ \t]/.test(t)) {
+          // Left pim block without finding address-family
+          out.push(' address-family ipv4');
+          out.push(`  ${newLine}`);
+          replaced = true;
+          inPim = false;
+        } else if (afHeaderRe.test(t.trim())) {
+          inAf = true;
+        }
+        out.push(t); continue;
+      }
+      if (inAf) {
+        if (t !== '' && !/^[ \t]{2}/.test(t) && !/^[ \t][ \t]/.test(t)) {
+          if (!replaced) { out.push(`  ${newLine}`); replaced = true; }
+          inAf = false; inPim = false;
+        } else if (matchRe.test(t.trim())) {
+          out.push(`  ${newLine}`); replaced = true; continue;
+        }
+      }
+      out.push(t);
+    }
+    if (!replaced) out.push(`  ${newLine}`);
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
+  function _removePimAfLine(router, matchRe) {
+    const cfg = Storage.read(router.id, 'running') || '';
+    const pimHeaderRe = /^router\s+pim\s*$/i;
+    const afHeaderRe = /^address-family\s+ipv4\s*$/i;
+    let inPim = false, inAf = false;
+    const out = cfg.split('\n').filter(raw => {
+      const t = raw.trimEnd();
+      if (pimHeaderRe.test(t)) { inPim = true; return true; }
+      if (inPim && afHeaderRe.test(t.trim())) { inAf = true; return true; }
+      if (inAf) {
+        if (t !== '' && !/^[ \t]{2}/.test(t)) { inAf = false; inPim = false; return true; }
+        if (matchRe.test(t.trim())) return false;
+      }
+      return true;
+    });
+    Storage.write(router.id, 'running', out.join('\n'));
+  }
+
   const showHandlers = {};
 
   showHandlers['running-config'] = showHandlers['run'] = (args, router, io) => {
@@ -1657,6 +1716,65 @@
     }
   };
 
+  // show pim neighbor / topology / rpf
+  showHandlers['pim'] = (args, router, io) => {
+    const sub = _ex(args[0] || 'neighbor', ['neighbor','topology','rpf','rp']);
+    if (sub === 'neighbor' || !sub) {
+      const neighbors = window.RouterMulticast ? window.RouterMulticast.getPimNeighbors(router.id) : [];
+      io.println('PIM neighbors in VRF default');
+      io.println('Flag: B - Bidir Capable, P - Proxy Capable, DR - Designated Router,');
+      io.println('      E - ECMP Redirect Capable, S - State Refresh Capable');
+      io.println('');
+      if (neighbors.length === 0) {
+        io.println(' (no PIM neighbors)');
+      } else {
+        io.println('Neighbor address  Interface            Uptime    Expires   DR pri Flags');
+        for (const n of neighbors) {
+          const sec = Math.floor((Date.now() - n.establishedAt) / 1000);
+          const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+          const uptime = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+          io.println(`${(n.neighborIp||n.neighborId).padEnd(18)}${n.localIface.padEnd(21)}${uptime}  00:01:30  1      B DR`);
+        }
+      }
+      return;
+    }
+    if (sub === 'rp') {
+      const rpMappings = window.RouterMulticast ? window.RouterMulticast.getRpMappings(router.id) : [];
+      io.println('PIM Group-to-RP Mappings');
+      io.println('');
+      if (rpMappings.length === 0) {
+        io.println(' (no RP mappings)');
+      } else {
+        for (const m of rpMappings) {
+          io.println(`Group(s) ${m.groupPrefix}/${m.groupPrefixLen}`);
+          io.println(`  RP ${m.rpIp}  (?)`);
+          io.println('    Info source: Static, priority 0, holdtime 0');
+        }
+      }
+      return;
+    }
+    if (sub === 'topology') {
+      const mrib = window.RouterMulticast ? window.RouterMulticast.getMrib(router.id) : [];
+      io.println('PIM Topology Table for VRF default');
+      io.println('');
+      if (mrib.length === 0) {
+        io.println(' (no entries)');
+      } else {
+        for (const entry of mrib) {
+          io.println(`IP Multicast Topology Entry`);
+          io.println(`(*,G) (*,${entry.group}) SM`);
+          io.println(`  RP ${entry.rp}`);
+          io.println(`  Upstream Interface: ${entry.iif || 'Null'}`);
+          io.println(`  Downstream Interface List:`);
+          entry.oifList.forEach(oif => io.println(`    ${oif}`));
+          io.println('');
+        }
+      }
+      return;
+    }
+    io.println(`% Invalid input after 'show pim'`);
+  };
+
   // モード別動詞候補
   const _ECANDS = ['configure','clear','commit','copy','disable','enable','exit','help','no','ping','send','show','write'];
   const _CCANDS = ['class-map','do','end','exit','hostname','interface','ip','no','policy-map','router','vrf'];
@@ -1713,6 +1831,10 @@
             state.configMode = 'sr-srv6';
           } else if (state.configMode === 'sr-srv6') {
             state.configMode = 'global';
+          } else if (state.configMode === 'pim-af') {
+            state.configMode = 'pim';
+          } else if (state.configMode === 'pim') {
+            state.configMode = 'global'; state.configPimProc = null;
           } else if (state.configMode === 'isis-if') {
             state.configMode = 'isis'; state.configIsisIface = null;
           } else if (state.configMode === 'ospf-if') {
@@ -2275,6 +2397,49 @@
 
       // ---------- global config ----------
 
+      // ---------- config-pim モード ----------
+      if (state.configMode === 'pim') {
+        if (verb === 'address-family') {
+          state.configMode = 'pim-af';
+          return true;
+        }
+        io.println(`% Invalid input in config-pim: ${parts.join(' ')}`);
+        return true;
+      }
+
+      // ---------- config-pim-af モード ----------
+      if (state.configMode === 'pim-af') {
+        if (verb === 'rp-address') {
+          const rpIp = parts[1];
+          if (!rpIp) { io.println('% Incomplete command.'); return true; }
+          const line = parts[2] ? `rp-address ${rpIp} ${parts[2]}` : `rp-address ${rpIp}`;
+          _updatePimAfLine(router, /^rp-address\s+/i, line);
+          if (window.RouterMulticast) window.RouterMulticast.recalculate();
+          return true;
+        }
+        if (verb === 'interface') {
+          const ifName = parts[1];
+          if (!ifName) { io.println('% Incomplete command.'); return true; }
+          _updatePimAfLine(router, new RegExp(`^interface\\s+${ifName.replace(/[-/]/g,'[-\\/]')}\\b`, 'i'), `interface ${ifName} enable`);
+          if (window.RouterMulticast) window.RouterMulticast.recalculate();
+          return true;
+        }
+        if (verb === 'no') {
+          if ((parts[1]||'').toLowerCase() === 'rp-address') {
+            _removePimAfLine(router, /^rp-address\s+/i);
+            if (window.RouterMulticast) window.RouterMulticast.recalculate();
+            return true;
+          }
+          if ((parts[1]||'').toLowerCase() === 'interface' && parts[2]) {
+            _removePimAfLine(router, new RegExp(`^interface\\s+${parts[2].replace(/[-/]/g,'[-\\/]')}\\b`, 'i'));
+            if (window.RouterMulticast) window.RouterMulticast.recalculate();
+            return true;
+          }
+        }
+        io.println(`% Invalid input in config-pim-af: ${parts.join(' ')}`);
+        return true;
+      }
+
       // interface <name>
       if (verb === 'interface' || verb === 'int') {
         const name = parts[1];
@@ -2359,6 +2524,24 @@
         if (!proc) { io.println('% Incomplete command.'); return true; }
         _removeOspfBlock(router, proc);
         RouterOspf.recalculate(router.id);
+        return true;
+      }
+
+      // router pim
+      if (verb === 'router' && (parts[1]||'').toLowerCase() === 'pim') {
+        const cfg = Storage.read(router.id, 'running') || '';
+        if (!/^router\s+pim\s*$/im.test(cfg)) {
+          Storage.write(router.id, 'running', cfg.trimEnd() + '\nrouter pim\n address-family ipv4\n');
+        }
+        state.configMode = 'pim';
+        state.configPimProc = 'pim';
+        return true;
+      }
+      // no router pim
+      if (verb === 'no' && _ex(parts[1], ['router','interface','hostname']) === 'router' && (parts[2]||'').toLowerCase() === 'pim') {
+        const cfg = Storage.read(router.id, 'running') || '';
+        Storage.write(router.id, 'running', cfg.replace(/^router\s+pim\s*\n(?:[ \t]+.*\n)*/im, ''));
+        if (window.RouterMulticast) window.RouterMulticast.recalculate();
         return true;
       }
 
@@ -2637,7 +2820,7 @@
     }
 
     if (verb === 'show' || verb === 'sh') {
-      const _SHOW_KEYS = ['class-map','policy-map','running-config','run','startup-config','start','version','ver','interfaces','ip','ipv6','bgp','route','arp','isis','ospf','vrf','mpls','segment-routing'];
+      const _SHOW_KEYS = ['class-map','policy-map','running-config','run','startup-config','start','version','ver','interfaces','ip','ipv6','bgp','route','arp','isis','ospf','vrf','mpls','segment-routing','pim'];
       const sub = _ex(parts[1], _SHOW_KEYS);
       if (!sub) { io.println('% Incomplete command.'); return true; }
       const handler = showHandlers[sub];
@@ -2880,6 +3063,24 @@
       return [];
     }
 
+    // ---- config-pim ----
+    if (mode === 'pim') {
+      if (before.length === 0) return _fil(['address-family','exit','end']);
+      const v = before[0];
+      if (v === 'address-family' && before.length === 1) return _fil(['ipv4']);
+      return [];
+    }
+
+    // ---- config-pim-af ----
+    if (mode === 'pim-af') {
+      if (before.length === 0) return _fil(['rp-address','interface','no','exit','end']);
+      const v = before[0];
+      if (v === 'interface' && before.length === 1) return _fil(ifaceNamesFull());
+      if (v === 'no' && before.length === 1) return _fil(['rp-address','interface']);
+      if (v === 'no' && before[1] === 'interface' && before.length === 2) return _fil(ifaceNames());
+      return [];
+    }
+
     // ---- exec mode ----
     if (before.length === 0) {
       return _fil(['configure','show','ping','commit','clear','exit','help']);
@@ -2890,7 +3091,7 @@
     if (verb === 'clear' && before.length === 1) return _fil(['bgp','isis','ospf']);
 
     if (verb === 'show' || verb === 'sh') {
-      if (before.length === 1) return _fil(['running-config','startup-config','version','interfaces','ip','ipv6','bgp','route','arp','isis','ospf','vrf','mpls','segment-routing','class-map','policy-map']);
+      if (before.length === 1) return _fil(['running-config','startup-config','version','interfaces','ip','ipv6','bgp','route','arp','isis','ospf','vrf','mpls','segment-routing','class-map','policy-map','pim']);
       const sub = before[1];
       if (sub === 'ip' && before.length === 2) return _fil(['interface','bgp','route']);
       if (sub === 'ip' && before[2] === 'interface' && before.length === 3) return _fil(['brief',...ifaceNames()]);
@@ -2909,6 +3110,7 @@
       if (sub === 'class-map' && before.length === 2) return _fil(cmapNames());
       if (sub === 'policy-map' && before.length === 2) return _fil(['interface',...pmapNames()]);
       if (sub === 'policy-map' && before[2] === 'interface' && before.length === 3) return _fil(ifaceNames());
+      if (sub === 'pim' && before.length === 2) return _fil(['neighbor','topology','rp']);
     }
     return [];
   }
@@ -3087,10 +3289,48 @@
     });
   }
 
+  // Multicast パーサ登録
+  if (window.RouterMulticast) {
+    window.RouterMulticast.registerOsParser('ios-xr', {
+      getMulticastConfig(cfg) {
+        const pimHeaderRe = /^router\s+pim\s*$/im;
+        const enabled = pimHeaderRe.test(cfg);
+        const interfaces = [];
+        const rpMappings = [];
+        if (enabled) {
+          const lines = (cfg || '').split('\n');
+          let inPim = false, inAf = false;
+          for (const raw of lines) {
+            const t = raw.trimEnd();
+            if (pimHeaderRe.test(t)) { inPim = true; continue; }
+            if (inPim && !inAf && /^address-family\s+ipv4/i.test(t.trim())) { inAf = true; continue; }
+            if (inPim && inAf) {
+              if (t !== '' && !/^[ \t]{2}/.test(t)) { inAf = false; inPim = false; continue; }
+              const m = t.trim().match(/^interface\s+(\S+)/i);
+              if (m) { interfaces.push({ name: m[1], mode: 'sparse' }); continue; }
+              const r = t.trim().match(/^rp-address\s+([\d.]+)(?:\s+([\d.]+\/[\d]+))?/i);
+              if (r) {
+                const gr = r[2] ? r[2].split('/') : ['224.0.0.0', '4'];
+                rpMappings.push({ rpIp: r[1], groupPrefix: gr[0], groupPrefixLen: parseInt(gr[1], 10) });
+              }
+            }
+          }
+        }
+        return { enabled, interfaces, rpMappings };
+      },
+      getInterfaceList(cfg) {
+        return parseInterfaces(cfg || '').map(blk => {
+          const info = getIfIpInfo(blk);
+          return info ? { name: blk.name, ip: info.ip, mask: info.mask } : null;
+        }).filter(Boolean);
+      },
+    });
+  }
+
   global.RouterIosXr = { handleCommand, complete, restoreBgpSessions };
 
-  // restoreAll に SRv6 を追加
-  setTimeout(() => { if (window.RouterSrv6) window.RouterSrv6.restoreAll(); }, 0);
+  // restoreAll に SRv6 / Multicast を追加
+  setTimeout(() => { if (window.RouterSrv6) window.RouterSrv6.restoreAll(); if (window.RouterMulticast) window.RouterMulticast.restoreAll(); }, 0);
 
   // IPv6 パーサ登録
   if (window.RouterIpv6) {

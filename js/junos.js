@@ -866,6 +866,36 @@
       return _handleSetCoS(parts, router, io);
     }
 
+    if (cat === 'protocols' && (rest[0] || '').toLowerCase() === 'pim') {
+      const pimRest = rest.slice(1);
+      // set protocols pim interface <if> mode sparse
+      if ((pimRest[0] || '').toLowerCase() === 'interface') {
+        const ifname = pimRest[1];
+        if (!ifname) { io.println('% Incomplete: interface name required'); return true; }
+        const props = pimRest.slice(2).join(' ');
+        _deleteLines(router, new RegExp(`^set protocols pim interface ${ifname.replace(/\//g,'\\/')} `, 'i'));
+        _setLine(router, `set protocols pim interface ${ifname}${props ? ' ' + props : ' mode sparse'}`);
+        if (window.RouterMulticast) window.RouterMulticast.recalculate();
+        return true;
+      }
+      // set protocols pim rp static address <ip> [group-ranges <prefix>/<len>]
+      if ((pimRest[0] || '').toLowerCase() === 'rp' && (pimRest[1] || '').toLowerCase() === 'static' && (pimRest[2] || '').toLowerCase() === 'address') {
+        const rpIp = pimRest[3];
+        if (!rpIp) { io.println('% Incomplete: RP address required'); return true; }
+        const grIdx = pimRest.findIndex(w => w.toLowerCase() === 'group-ranges');
+        const grPrefix = grIdx >= 0 && pimRest[grIdx + 1] ? pimRest[grIdx + 1] : null;
+        _deleteLines(router, new RegExp(`^set protocols pim rp static address ${rpIp.replace(/\./g,'\\.')}(\\s+.*)?$`, 'i'));
+        const line = grPrefix
+          ? `set protocols pim rp static address ${rpIp} group-ranges ${grPrefix}`
+          : `set protocols pim rp static address ${rpIp}`;
+        _setLine(router, line);
+        if (window.RouterMulticast) window.RouterMulticast.recalculate();
+        return true;
+      }
+      io.println(`% Unknown protocols pim sub-command`);
+      return true;
+    }
+
     io.println(`% Unknown set path: ${parts.slice(1).join(' ')}`);
     return true;
   }
@@ -957,6 +987,8 @@
     _deleteLines(router, /^set class-of-service\s+/i);
     return true;
   }
+
+  function _setLineMissing(router, line) {
     const cfg = Storage.read(router.id, 'running') || '';
     return !cfg.split('\n').some(l => l.trim() === line.trim());
   }
@@ -1063,6 +1095,18 @@
           _deleteLines(router, /^set protocols isis\s+/i);
         }
         RouterIsis.recalculate(router.id);
+        return true;
+      }
+      if (proto === 'pim') {
+        const pimRest = rest.slice(1);
+        if ((pimRest[0] || '').toLowerCase() === 'interface' && pimRest[1]) {
+          _deleteLines(router, new RegExp(`^set protocols pim interface ${pimRest[1].replace(/\//g,'\\/')}(\\s+.*)?$`, 'i'));
+        } else if ((pimRest[0] || '').toLowerCase() === 'rp') {
+          _deleteLines(router, /^set protocols pim rp\s+/i);
+        } else {
+          _deleteLines(router, /^set protocols pim\s+/i);
+        }
+        if (window.RouterMulticast) window.RouterMulticast.recalculate();
         return true;
       }
       if (proto === 'mpls') {
@@ -1217,8 +1261,67 @@
     }
 
     if (verb === 'show') {
-      const _SHOW_J = ['class-of-service','interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances','ldp','spring-te','ipv6','srv6'];
+      const _SHOW_J = ['class-of-service','interfaces','bgp','route','configuration','running-config','version','arp','isis','ospf','routing-instances','ldp','spring-te','ipv6','srv6','pim'];
       const sub = _ex(parts[1], _SHOW_J);
+
+      if (sub === 'pim') {
+        const sub2 = (parts[2] || 'neighbors').toLowerCase();
+        if (sub2 === 'neighbors' || sub2 === 'neighbor') {
+          const neighbors = window.RouterMulticast ? window.RouterMulticast.getPimNeighbors(router.id) : [];
+          io.println('');
+          io.println('Instance: master');
+          io.println('');
+          if (neighbors.length === 0) {
+            io.println(' (no PIM neighbors)');
+          } else {
+            io.println('Neighbor address  Interface              Status      Uptime   DR pri');
+            for (const n of neighbors) {
+              const sec = Math.floor((Date.now() - n.establishedAt) / 1000);
+              const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+              const uptime = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+              io.println(`${(n.neighborIp||n.neighborId).padEnd(18)}${n.localIface.padEnd(23)}Up           ${uptime}  1`);
+            }
+          }
+          return true;
+        }
+        if (sub2 === 'rps' || sub2 === 'rp') {
+          const rpMappings = window.RouterMulticast ? window.RouterMulticast.getRpMappings(router.id) : [];
+          io.println('');
+          io.println('Instance: master');
+          io.println('');
+          if (rpMappings.length === 0) {
+            io.println(' (no RP mappings)');
+          } else {
+            io.println('RP address       Type   Holdtime Timeout Groups Group prefixes');
+            for (const m of rpMappings) {
+              io.println(`${m.rpIp.padEnd(17)}static 0        -       0      ${m.groupPrefix}/${m.groupPrefixLen}`);
+            }
+          }
+          return true;
+        }
+        if (sub2 === 'join') {
+          const mrib = window.RouterMulticast ? window.RouterMulticast.getMrib(router.id) : [];
+          io.println('');
+          io.println('Instance: master');
+          io.println('');
+          if (mrib.length === 0) {
+            io.println(' (no PIM join entries)');
+          } else {
+            for (const entry of mrib) {
+              io.println(`Group: ${entry.group}`);
+              io.println(`    Source: *`);
+              io.println(`    RP: ${entry.rp}`);
+              io.println(`    Flags: sparse,rptree,wildcard`);
+              io.println(`    Upstream interface: ${entry.iif || 'Null'}`);
+              entry.oifList.forEach(oif => io.println(`    Downstream interface list: ${oif}`));
+              io.println('');
+            }
+          }
+          return true;
+        }
+        io.println(`% Unknown 'show pim ${sub2}'`);
+        return true;
+      }
 
       // show class-of-service interface [<ifname>] | show class-of-service classifier name [<name>]
       if (sub === 'class-of-service') {
@@ -1810,10 +1913,36 @@
     });
   }
 
+  // Multicast パーサ登録
+  if (window.RouterMulticast) {
+    window.RouterMulticast.registerOsParser('junos', {
+      getMulticastConfig(cfg) {
+        const ifaceLines = (cfg || '').match(/^set protocols pim interface (\S+)/gim) || [];
+        const interfaces = ifaceLines.map(l => {
+          const m = l.match(/^set protocols pim interface (\S+)/i);
+          return m ? { name: m[1], mode: 'sparse' } : null;
+        }).filter(Boolean);
+        const enabled = interfaces.length > 0 || /^set protocols pim rp\s+/im.test(cfg);
+        const rpMappings = [];
+        const rpRe = /^set protocols pim rp static address ([\d.]+)(?:\s+group-ranges\s+([\d.]+\/[\d]+))?/gim;
+        let m;
+        while ((m = rpRe.exec(cfg || ''))) {
+          const rpIp = m[1];
+          const gr = m[2] ? m[2].split('/') : ['224.0.0.0', '4'];
+          rpMappings.push({ rpIp, groupPrefix: gr[0], groupPrefixLen: parseInt(gr[1], 10) });
+        }
+        return { enabled, interfaces, rpMappings };
+      },
+      getInterfaceList(cfg) {
+        return getInterfaces(cfg).map(f => ({ name: f.name, ip: f.ip, mask: f.mask }));
+      },
+    });
+  }
+
   global.RouterJunos = { handleCommand, complete, restoreBgpSessions };
 
-  // restoreAll に SRv6 を追加
-  setTimeout(() => { if (window.RouterSrv6) window.RouterSrv6.restoreAll(); }, 0);
+  // restoreAll に SRv6 / Multicast を追加
+  setTimeout(() => { if (window.RouterSrv6) window.RouterSrv6.restoreAll(); if (window.RouterMulticast) window.RouterMulticast.restoreAll(); }, 0);
 
   // IPv6 パーサ登録
   if (window.RouterIpv6) {
