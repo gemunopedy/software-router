@@ -2702,7 +2702,7 @@
       const v = before[0];
       if ((v === 'interface'||v==='int') && before.length === 1) {
         const existing = ifaceNames();
-        const defaults = ['GigabitEthernet1','GigabitEthernet2','GigabitEthernet3','Loopback0'];
+        const defaults = ['GigabitEthernet0/0/0/0','GigabitEthernet0/0/0/1','GigabitEthernet0/0/0/2','Loopback0'];
         const all = [...new Set([...existing, ...defaults.filter(d => !existing.some(e => e.toLowerCase() === d.toLowerCase()))])];
         return all.filter(n => n.toLowerCase().startsWith(last.toLowerCase()));
       }
